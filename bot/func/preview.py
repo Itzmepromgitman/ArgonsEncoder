@@ -28,7 +28,7 @@ async def generate_preview(user_id: int, settings: dict) -> str:
             log.warning(f"Preview Gen: No watermark filter generated for user {user_id}")
             return None
 
-        output_path = f"watermarks/preview_{user_id}.jpg"
+        output_path = f"watermarks/preview_{user_id}_{int(__import__('time').time())}.jpg"
         cmd = ["ffmpeg", "-y"]
 
         # Input: White background
@@ -49,7 +49,7 @@ async def generate_preview(user_id: int, settings: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
 
         if process.returncode != 0:
             log.error(f"Preview Gen Failed: {stderr.decode()}")

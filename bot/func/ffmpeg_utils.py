@@ -1,10 +1,20 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import os
+import re
 import shlex
+from typing import Dict, List, Optional
+
+from bot.config import FFMPEG_THREADS, FONT_PATH, WATERMARK_DIR
 from bot.logger import LOGGER
-from typing import Dict, List
 
 log = LOGGER(__name__)
+
+VALID_CODECS = {"libx264", "libx265", "libvpx-vp9", "libaom-av1", "mpeg4"}
+VALID_PRESETS = [
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium", "slow", "slower", "veryslow",
+]
+VALID_AUDIO_CODECS = {"aac", "ac3", "copy"}
 
 
 def validate_ffmpeg_command(cmd: str) -> bool:
@@ -20,7 +30,6 @@ def validate_ffmpeg_command(cmd: str) -> bool:
             if arg in forbidden_flags:
                 return False
 
-        # Basic check to ensure it's not empty or just whitespace
         if not cmd.strip():
             return False
 
@@ -28,82 +37,95 @@ def validate_ffmpeg_command(cmd: str) -> bool:
     except Exception:
         return False
 
-def prepare_watermark_assets(user_id: int, settings: Dict):
-    """
-    Checks for watermark assets in settings and restores them to disk if missing.
-    Updates settings with local paths.
-    """
-    wm = settings.get("watermark", {})
 
-    # Ensure directories
-    if not os.path.exists("watermarks"):
-        os.makedirs("watermarks")
-    if not os.path.exists("watermarks/fonts"):
-        os.makedirs("watermarks/fonts")
-
-    # Restore Image
-    if "image_data" in wm:
-        image_path = os.path.join(os.getcwd(), "watermarks", f"{user_id}.png")
-        if not os.path.exists(image_path):
-            try:
-                with open(image_path, "wb") as f:
-                    f.write(wm["image_data"])
-                log.info(f"Restored watermark image for user {user_id}")
-            except Exception as e:
-                log.error(f"Failed to restore watermark image: {e}")
-
-        # Update path in settings to ensure it points to the restored file
-        wm["image_path"] = image_path
-
-    # Restore Font
-    if "font_data" in wm:
-        font_path = f"watermarks/fonts/{user_id}.ttf"
-        if not os.path.exists(font_path):
-            try:
-                with open(font_path, "wb") as f:
-                    f.write(wm["font_data"])
-                log.info(f"Restored custom font for user {user_id}")
-            except Exception as e:
-                log.error(f"Failed to restore custom font: {e}")
-
-def prepare_thumbnail(user_id: int, settings: Dict) -> str:
-    """
-    Checks for thumbnail in settings and restores it to disk if missing.
-    Returns the path to the thumbnail if it exists, else None.
-    """
-    if "thumbnail" in settings:
-        # Ensure directory
-        if not os.path.exists("watermarks"):
-            os.makedirs("watermarks")
-
-        thumb_path = os.path.join(os.getcwd(), "watermarks", f"thumb_{user_id}.jpg")
-
-        if not os.path.exists(thumb_path):
-            try:
-                with open(thumb_path, "wb") as f:
-                    f.write(settings["thumbnail"])
-                log.info(f"Restored thumbnail for user {user_id}")
-            except Exception as e:
-                log.error(f"Failed to restore thumbnail: {e}")
-                return None
-
-        return thumb_path
+def sanitize_custom_name(name: str) -> Optional[str]:
+    """Whitelist custom command names so they are safe as Mongo keys and callback data."""
+    name = (name or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+        return name
     return None
 
+
+def _write_asset(path: str, data: bytes) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        return True
+    except Exception as e:
+        log.error(f"Failed to write asset {path}: {e}")
+        return False
+
+
+def prepare_watermark_assets(user_id: int, settings: Dict):
+    """
+    Restores watermark assets to disk if missing.
+    Legacy blobs stored inside settings are migrated to disk and stripped from the DB doc.
+    """
+    wm = settings.get("watermark", {})
+    changed = False
+
+    image_path = os.path.join(WATERMARK_DIR, f"{user_id}.png")
+    font_path = os.path.join(WATERMARK_DIR, "fonts", f"{user_id}.ttf")
+
+    # Migrate legacy inline blobs out of Mongo
+    if isinstance(wm.get("image_data"), bytes):
+        if not os.path.exists(image_path):
+            _write_asset(image_path, wm["image_data"])
+        del wm["image_data"]
+        changed = True
+    if isinstance(wm.get("font_data"), bytes):
+        if not os.path.exists(font_path):
+            _write_asset(font_path, wm["font_data"])
+        del wm["font_data"]
+        changed = True
+
+    if changed:
+        settings["watermark"] = wm
+
+    if not os.path.exists(font_path) and not os.path.exists(image_path):
+        return
+
+
+def prepare_thumbnail(user_id: int, settings: Dict) -> Optional[str]:
+    """Restores the user's custom thumbnail to disk. Returns path or None."""
+    thumb = settings.get("thumbnail")
+    if not thumb or not isinstance(thumb, bytes):
+        return None
+
+    from bot.config import THUMB_DIR
+
+    thumb_path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
+
+    if not os.path.exists(thumb_path):
+        if not _write_asset(thumb_path, thumb):
+            return None
+
+    return thumb_path
+
+
+def escape_drawtext(text: str) -> str:
+    r"""Escape text for use inside a drawtext filter body. Order matters."""
+    text = text.replace("\\", "\\\\")
+    text = text.replace("%", "\\%")
+    text = text.replace(":", "\\:")
+    text = text.replace(",", "\\,")
+    text = text.replace("'", "")
+    text = text.replace("\n", " ")
+    return text
+
+
 def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
-    """
-    Generates the FFmpeg filter string for watermarks.
-    """
+    """Generates the FFmpeg filter string for watermarks."""
     wm_settings = settings.get("watermark", {})
     wm_type = wm_settings.get("type", "none")
 
-    if wm_type == "none":
+    if not wm_settings.get("enabled", False) or wm_type == "none":
         return ""
 
     position = wm_settings.get("position", "top-right")
     opacity = float(wm_settings.get("opacity", 0.5))
 
-    # Timing
     timing_mode = wm_settings.get("timing_mode", "always")
     start_time = float(wm_settings.get("start_time", 0))
     end_time = float(wm_settings.get("end_time", 0))
@@ -114,255 +136,267 @@ def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
     if timing_mode == "range":
         enable_expr = f":enable='between(t,{start_time},{end_time})'"
     elif timing_mode == "interval":
-        # Show for 'interval_duration' seconds every 'interval_period' seconds
-        # mod(t, period) < duration
-        enable_expr = f":enable='lt(mod(t,{interval_period}),{interval_duration})'"
+        enable_expr = (
+            f":enable='lt(mod(t,{interval_period}),{interval_duration})'"
+        )
 
-    # Margins
     margins = wm_settings.get("margins", {})
     m_top = margins.get("top", 10)
     m_bottom = margins.get("bottom", 10)
     m_left = margins.get("left", 10)
     m_right = margins.get("right", 10)
 
+    # Overlay expressions: uppercase W/H refer to the main video,
+    # lowercase w/h to the overlay itself.
     if position == "top-left":
         x, y = f"{m_left}", f"{m_top}"
     elif position == "top-right":
-        x, y = f"w-tw-{m_right}", f"{m_top}"
+        x, y = f"W-w-{m_right}", f"{m_top}"
     elif position == "bottom-left":
-        x, y = f"{m_left}", f"h-th-{m_bottom}"
-    elif position == "bottom-right":
-        x, y = f"w-tw-{m_right}", f"h-th-{m_bottom}"
+        x, y = f"{m_left}", f"H-h-{m_bottom}"
+    else:  # bottom-right
+        x, y = f"W-w-{m_right}", f"H-h-{m_bottom}"
 
     credit_text = ""
     if for_preview:
-        # Add Credit Text (Developed by Argon) only for preview
-        credit_text = ",drawtext=fontfile='bot/fonts/Roboto-Regular.ttf':text='Developed by Argon':fontsize=24:fontcolor=black:x=w-tw-10:y=h-th-10"
+        credit_text = (
+            ",drawtext=fontfile='bot/fonts/Roboto-Regular.ttf'"
+            ":text='Developed by Argon':fontsize=24:fontcolor=black"
+            ":x=W-tw-10:y=H-th-10"
+        )
 
     if wm_type == "text":
-        text = wm_settings.get("text", "AutoAnimePro")
+        text = str(wm_settings.get("text", "Argons Encoder"))
         font_size = int(wm_settings.get("font_size", 24))
         border_opacity = float(wm_settings.get("border_opacity", 0.5))
 
-        # Font Selection
         user_id = settings.get("user_id")
-        font_path = "bot/fonts/Roboto-Regular.ttf" # Default
-
+        font_path = FONT_PATH
         if user_id:
-            custom_font = f"watermarks/fonts/{user_id}.ttf"
+            custom_font = os.path.join(WATERMARK_DIR, "fonts", f"{user_id}.ttf")
             if os.path.exists(custom_font):
                 font_path = custom_font
 
-        # Italic, Semi-transparent text with dark semi-transparent box border
-        # fontcolor=white@opacity
-        # box=1:boxcolor=black@border_opacity:boxborderw=5
-
-        # Escape text for drawtext
-        text = text.replace("'", "").replace(":", "\\:")
+        safe_text = escape_drawtext(text)
 
         return (
-            f"drawtext=fontfile='{font_path}':text='{text}':fontsize={font_size}:fontcolor=white@{opacity}:"
-            f"x={x}:y={y}:box=1:boxcolor=black@{border_opacity}:boxborderw=5{enable_expr}"
+            f"drawtext=fontfile='{font_path}':text='{safe_text}':fontsize={font_size}"
+            f":fontcolor=white@{opacity}:x={x}:y={y}"
+            f":box=1:boxcolor=black@{border_opacity}:boxborderw=5{enable_expr}"
             f"{credit_text}"
         )
 
     elif wm_type == "image":
         image_path = wm_settings.get("image_path", "")
-        if not image_path:
+        if not image_path or not os.path.exists(image_path):
+            log.warning(f"Watermark image missing on disk: {image_path}")
             return ""
 
-        log.info(f"Watermark Image Path: {image_path}")
-        log.info(f"Exists: {os.path.exists(image_path)}")
-        log.info(f"CWD: {os.getcwd()}")
+        scale = float(wm_settings.get("scale", 0.1))
 
-        scale = float(wm_settings.get("scale", 0.1)) # Scale relative to video width?
-        # Actually easier to just scale the overlay input
-        # We need a complex filter graph for image overlay
-        # [0:v][1:v] overlay...
-        # But here we are returning a filter string for -vf.
-        # So we use the 'movie' filter source.
-
-        # movie=filename [wm]; [wm] colorchannelmixer=aa=opacity [wm_trans]; [in][wm_trans] overlay=x:y
-        # Note: 'movie' filter path needs to be escaped properly
-
-        # For simplicity in this function, we return the filter chain part.
-        # However, 'movie' filter is tricky with windows paths.
-        # Let's try to use forward slashes.
-        # Try to use relative path to avoid double-prefix issues
         try:
             image_path = os.path.relpath(image_path, os.getcwd())
         except ValueError:
-            pass # Keep absolute if on different drive
+            pass
+        image_path = image_path.replace("\\", "/").replace("'", r"\'").replace(":", r"\:")
 
-        image_path = image_path.replace("\\", "/")
-
-        # Resize image first?
-        # scale=iw*scale:-1
-
-        # Ensure RGBA format for opacity to work on all image types
         return (
-            f"movie='{image_path}',scale=iw*{scale}:-1,format=rgba,colorchannelmixer=aa={opacity}[wm];"
-            f"[0:v][wm]overlay=x={x.replace('tw', 'w').replace('th', 'h')}:y={y.replace('tw', 'w').replace('th', 'h')}{enable_expr}"
+            f"movie='{image_path}',scale=iw*{scale}:-1,format=rgba,"
+            f"colorchannelmixer=aa={opacity}[wm];"
+            f"[0:v][wm]overlay=x='{x}':y='{y}'{enable_expr}"
             f"{credit_text}"
         )
 
     return ""
 
 
+def _video_codec_args(codec: str, crf: str, preset: str) -> List[str]:
+    """Codec-aware quality flags. CRF/preset are NOT universal options."""
+    codec = codec if codec in VALID_CODECS else "libx264"
+    args: List[str] = ["-c:v", codec]
+
+    if codec in ("libx264", "libx265"):
+        args.extend(["-crf", str(crf), "-preset", preset])
+    elif codec == "libvpx-vp9":
+        args.extend(["-crf", str(crf), "-b:v", "0"])
+    elif codec == "libaom-av1":
+        args.extend(["-crf", str(crf), "-cpu-used", "4"])
+    elif codec == "mpeg4":
+        # mpeg4 has no CRF; map to qscale and drop preset
+        try:
+            qscale = max(2, min(31, round((float(crf) / 51) * 30) + 2))
+        except (TypeError, ValueError):
+            qscale = 5
+        args.extend(["-qscale:v", str(qscale)])
+
+    return args
+
+
 def generate_ffmpeg_cmd(
-    settings: Dict, input_file: str, output_base: str, thumbnail_path: str = None
+    settings: Dict, input_file: str, output_base: str, thumbnail_path: Optional[str] = None
 ) -> List[Dict[str, str]]:
     """
     Generates a list of FFmpeg commands based on user settings.
-    Supports multiple resolutions.
 
     Returns a list of dicts:
     [
-        {"cmd": "ffmpeg ...", "output_file": "/path/to/output_1080p.mp4", "suffix": "1080p"},
+        {"cmd": "ffmpeg -i ... -y", "output_file": ".../out_1080p.mkv", "suffix": "1080p"},
         ...
     ]
+    The command string always contains its own `-i <input>`; FFmpegProcess.start()
+    must not add another one.
     """
     video_settings = settings.get("video", {})
     audio_settings = settings.get("audio", {})
     meta_settings = settings.get("metadata", {})
 
-    # Watermark Filter
-    wm_filter = generate_watermark_filter(settings)
-
-    crf = video_settings.get("crf", "23")
+    crf = str(video_settings.get("crf", "23"))
     preset = video_settings.get("preset", "medium")
-    codec = video_settings.get("codec", "mpeg4")
+    if preset not in VALID_PRESETS:
+        preset = "medium"
+    codec = video_settings.get("codec", "libx264")
     resolutions = video_settings.get("resolution", ["1080p"])
-
-    # Ensure resolutions is a list
     if isinstance(resolutions, str):
         resolutions = [resolutions]
 
+    remux = bool(video_settings.get("remux", False))
+
+    audio_codec = audio_settings.get("codec", "aac")
+    if audio_codec not in VALID_AUDIO_CODECS:
+        audio_codec = "aac"
     audio_bitrate = audio_settings.get("bitrate", "128k")
-    title = meta_settings.get("title", "")
-    author = meta_settings.get("author", "")
+    audio_track = str(audio_settings.get("track", "all")).lower()
+
+    subtitle_mode = video_settings.get("subtitle_mode", "copy")
+    if subtitle_mode not in ("copy", "drop"):
+        subtitle_mode = "copy"
+
+    sample_seconds = int(video_settings.get("sample_seconds", 0) or 0)
+
+    trim_start = float(video_settings.get("trim_start", 0) or 0)
+    trim_end = float(video_settings.get("trim_end", 0) or 0)
+
+    wm_filter = "" if remux else generate_watermark_filter(settings)
 
     commands = []
 
     for res in resolutions:
-        # Determine scale filter
-        scale_filter = ""
-        if res == "1080p":
-            scale_filter = "scale=-2:1080"
-        elif res == "720p":
-            scale_filter = "scale=-2:720"
-        elif res == "480p":
-            scale_filter = "scale=-2:480"
-        elif res == "360p":
-            scale_filter = "scale=-2:360"
+        res_heights = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+        target_h = res_heights.get(res)
 
-        # Combine filters
-        video_filters = []
-        if wm_filter:
-            if "movie=" in wm_filter:
-                if scale_filter:
-                    wm_filter_adjusted = wm_filter.replace("[0:v]", "[scaled]")
-                    video_filters.append(f"{scale_filter} [scaled]; {wm_filter_adjusted}")
-                else:
-                    video_filters.append(wm_filter)
-            else:
-                # Text watermark (simple filter)
-                if scale_filter:
-                    video_filters.append(scale_filter)
-                video_filters.append(wm_filter)
+        cmd = ["ffmpeg", "-i", input_file]
+
+        if remux:
+            # Fast container-fix mode: stream copy everything.
+            cmd.extend(["-map", "0", "-c", "copy"])
         else:
-            if scale_filter:
+            if thumbnail_path:
+                cmd.extend(["-i", thumbnail_path])
+
+            # Never upscale: cap height at source height via min(ih, TARGET).
+            scale_filter = ""
+            if target_h:
+                scale_filter = f"scale=-2:'min(ih,{target_h})'"
+
+            video_filters = []
+            is_complex = False
+            if wm_filter:
+                is_complex = "movie=" in wm_filter
+                if is_complex:
+                    if scale_filter:
+                        wm_adjusted = wm_filter.replace("[0:v]", "[scaled]")
+                        video_filters.append(f"{scale_filter} [scaled]; {wm_adjusted}")
+                    else:
+                        video_filters.append(wm_filter)
+                else:
+                    if scale_filter:
+                        video_filters.append(scale_filter)
+                    video_filters.append(wm_filter)
+            elif scale_filter:
                 video_filters.append(scale_filter)
 
-        # Build command
-        cmd = ["ffmpeg"]
-        cmd.extend(["-i", input_file])
+            if not is_complex:
+                cmd.extend(["-map", "0:v?"])
 
-        if thumbnail_path:
-            cmd.extend(["-i", thumbnail_path])
-
-        # Map streams
-        # Map streams
-        is_complex = video_filters and any("movie=" in f for f in video_filters)
-
-        if not is_complex:
-            cmd.extend(["-map", "0:v?"])
-
-        cmd.extend(["-map", "0:a?", "-map", "0:s?"])
-
-        if thumbnail_path:
-            cmd.extend(["-map", "1"])
-            cmd.extend(["-c:v:1", "png"])
-            cmd.extend(["-disposition:v:1", "attached_pic"])
-
-        if video_filters:
-            if any("movie=" in f for f in video_filters):
-                 cmd.extend(["-filter_complex", ",".join(video_filters)])
+            # Audio track selection
+            if audio_track in ("none", "off"):
+                pass  # no audio mapping
+            elif audio_track.isdigit():
+                cmd.extend(["-map", f"0:a:{audio_track}?"])
             else:
-                 cmd.extend(["-vf", ",".join(video_filters)])
+                cmd.extend(["-map", "0:a?"])
 
-        # Video
-        cmd.extend(["-c:v", codec])
-        cmd.extend(["-crf", str(crf)])
-        cmd.extend(["-preset", preset])
+            # Subtitles
+            if subtitle_mode == "copy":
+                cmd.extend(["-map", "0:s?"])
 
-        # Audio (AAC for compatibility)
-        cmd.extend(["-c:a", "aac"])
-        cmd.extend(["-b:a", audio_bitrate])
+            if thumbnail_path:
+                cmd.extend(["-map", "1", "-c:v:1", "png"])
+                cmd.extend(["-disposition:v:1", "attached_pic"])
 
-        # Subtitles (Copy for MKV)
-        cmd.extend(["-c:s", "copy"])
+            if video_filters:
+                if any("movie=" in f for f in video_filters):
+                    cmd.extend(["-filter_complex", ",".join(video_filters)])
+                else:
+                    cmd.extend(["-vf", ",".join(video_filters)])
 
-        # Metadata
-        # Smart Defaults (Branding)
-        bot_username = "AutoAnimeProBot" # Fallback
+            cmd.extend(_video_codec_args(codec, crf, preset))
 
-        # Global Defaults
-        global_meta = meta_settings.get("global", {}).copy()
-        if "title" not in global_meta: global_meta["title"] = "Encoded by @AutoAnimeProBot"
-        if "artist" not in global_meta: global_meta["artist"] = "@AutoAnimeProBot"
-        if "encoded_by" not in global_meta: global_meta["encoded_by"] = "@AutoAnimeProBot"
+            if audio_track not in ("none", "off"):
+                if audio_codec == "copy":
+                    cmd.extend(["-c:a", "copy"])
+                else:
+                    cmd.extend(["-c:a", audio_codec, "-b:a", audio_bitrate])
 
-        for key, value in global_meta.items():
-            if value:
-                cmd.extend(["-metadata", f"{key}={value}"])
+            if subtitle_mode == "copy":
+                cmd.extend(["-c:s", "copy"])
+            else:
+                cmd.extend(["-sn"])
 
-        # Video Stream Defaults
-        video_meta = meta_settings.get("video", {}).copy()
-        if "title" not in video_meta: video_meta["title"] = "Encoded by @AutoAnimeProBot"
-        if "handler_name" not in video_meta: video_meta["handler_name"] = "AutoAnimeProBot"
+            for key, value in meta_settings.get("global", {}).items():
+                if value:
+                    cmd.extend(["-metadata", f"{key}={value}"])
+            for key, value in meta_settings.get("video", {}).items():
+                if value:
+                    cmd.extend(["-metadata:s:v", f"{key}={value}"])
+            for key, value in meta_settings.get("audio", {}).items():
+                if value:
+                    cmd.extend(["-metadata:s:a", f"{key}={value}"])
+            for key, value in meta_settings.get("subtitle", {}).items():
+                if value:
+                    cmd.extend(["-metadata:s:s", f"{key}={value}"])
 
-        for key, value in video_meta.items():
-            if value:
-                cmd.extend(["-metadata:s:v", f"{key}={value}"])
+        # Trim + sample: compute a single effective duration limit.
+        # Output-side -ss keeps timestamps accurate; -t is relative to the seek.
+        duration_limit = None
+        if trim_end > trim_start > 0:
+            duration_limit = trim_end - trim_start
+        if sample_seconds > 0:
+            duration_limit = (
+                sample_seconds
+                if duration_limit is None
+                else min(duration_limit, sample_seconds)
+            )
 
-        # Audio Stream Defaults
-        audio_meta = meta_settings.get("audio", {}).copy()
-        if "title" not in audio_meta: audio_meta["title"] = "Encoded by @AutoAnimeProBot"
-        if "handler_name" not in audio_meta: audio_meta["handler_name"] = "AutoAnimeProBot"
+        if trim_start > 0:
+            cmd.extend(["-ss", str(trim_start)])
+        if duration_limit is not None:
+            cmd.extend(["-t", str(duration_limit)])
+        elif trim_end > 0:
+            cmd.extend(["-to", str(trim_end)])
 
-        for key, value in audio_meta.items():
-            if value:
-                cmd.extend(["-metadata:s:a", f"{key}={value}"])
+        cmd.extend(["-threads", str(FFMPEG_THREADS)])
 
-        # Subtitle Stream Defaults
-        # Do NOT default functional tags like language/forced/default
-        subtitle_meta = meta_settings.get("subtitle", {}).copy()
-        if "title" not in subtitle_meta: subtitle_meta["title"] = "Encoded by @AutoAnimeProBot"
-        if "handler_name" not in subtitle_meta: subtitle_meta["handler_name"] = "AutoAnimeProBot"
-
-        for key, value in subtitle_meta.items():
-            if value:
-                cmd.extend(["-metadata:s:s", f"{key}={value}"])
-
-        # Join command
-        cmd_str = shlex.join(cmd)
-
-        # Output filename
-        # If multiple resolutions, append suffix
+        # Output path is appended by FFmpegProcess.start() along with -y.
         suffix = f"_{res}" if len(resolutions) > 1 else ""
         output_path = f"{output_base}{suffix}.mkv"
 
-        commands.append({"cmd": cmd_str, "output_file": output_path, "suffix": res})
+        commands.append(
+            {
+                "cmd": shlex.join(cmd),
+                "output_file": output_path,
+                "suffix": res,
+            }
+        )
 
     return commands

@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict
 
+from bot.config import MAX_CONCURRENT_UPLOADS
 from bot.logger import LOGGER
 
 log = LOGGER(__name__)
@@ -31,12 +32,14 @@ class UploadManager:
     def __init__(self):
         if self._initialized:
             return
-        self._queue = asyncio.Queue()
+        self._queue: asyncio.Queue = asyncio.Queue()
         self._active_jobs: Dict[str, UploadJob] = {}
-        self._worker_tasks: list[asyncio.Task] = []
-        self._max_concurrent = 2
+        self._worker_tasks: list = []
+        self._max_concurrent = MAX_CONCURRENT_UPLOADS
         self._initialized = True
-        log.info("UploadManager initialized")
+        log.info(
+            f"UploadManager initialized with {MAX_CONCURRENT_UPLOADS} workers"
+        )
 
     async def start(self):
         if not self._worker_tasks:
@@ -56,7 +59,8 @@ class UploadManager:
         await self._queue.put(job)
         log.info(f"Upload job {job_id} added to queue for user {user_id}")
 
-        if not self._worker_tasks:
+        if not self._worker_tasks or all(t.done() for t in self._worker_tasks):
+            self._worker_tasks.clear()
             await self.start()
 
         return job_id
@@ -64,15 +68,18 @@ class UploadManager:
     async def _worker(self, worker_id: int):
         log.info(f"Upload worker {worker_id} started")
         while True:
+            job = None
             try:
                 job = await self._queue.get()
-
                 job.status = "uploading"
                 log.info(f"Worker {worker_id} starting upload job {job.job_id}")
 
                 try:
                     await job.func(*job.args, **job.kwargs)
                     job.status = "completed"
+                except asyncio.CancelledError:
+                    job.status = "cancelled"
+                    raise
                 except Exception as e:
                     job.status = "failed"
                     log.error(f"Upload job {job.job_id} failed: {e}")
@@ -81,6 +88,9 @@ class UploadManager:
                         del self._active_jobs[job.job_id]
                     self._queue.task_done()
 
+            except asyncio.CancelledError:
+                # Preserve worker liveness semantics for shutdown.
+                raise
             except Exception as e:
                 log.error(f"Error in upload worker {worker_id}: {e}")
                 await asyncio.sleep(1)

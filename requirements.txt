@@ -1,14 +1,7 @@
 pyrofork
 tgcrypto-pyrofork
 motor
-aiofiles
-asyncio
 python-dotenv
 aiohttp
-Flask==2.2.2
-gunicorn==20.1.0
-Werkzeug==2.2.2
-pytz
-uvloop
 psutil
-
+uvloop; sys_platform != "win32"

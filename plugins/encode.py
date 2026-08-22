@@ -1,21 +1,23 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import os
 import time
+import uuid
+from html import escape
 from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from bot.func.encode import encode, safe_download_media
+from bot.config import DOWNLOAD_DIR, MAX_FILE_SIZE
+from bot.decorator import is_admin, is_banned
+from bot.func.encode import encode, safe_download_media, sanitize_filename
 from bot.logger import LOGGER
 
 log = LOGGER(__name__)
 
 
 async def check_and_process_video_document(message: Message) -> dict:
-    """
-    Enhanced function that returns detailed information about the video document
-    """
+    """Returns detailed information about the video document."""
     result = {
         "is_video_document": False,
         "is_encodable": False,
@@ -23,75 +25,43 @@ async def check_and_process_video_document(message: Message) -> dict:
         "encoding_ready": False,
     }
 
-    # Check if message has video or document
     if not message.document and not message.video:
         log.info("Message has no document or video attachment")
         return result
 
-    # Get the media object (prioritize video over document)
     doc = message.video if message.video else message.document
     result["is_video_document"] = True
 
-    log.info(f"Processing media: type={'video' if message.video else 'document'}")
+    file_size = getattr(doc, "file_size", 0) or 0
 
-    # Collect file information
     result["file_info"] = {
         "file_name": getattr(doc, "file_name", None) or f"video_{int(time.time())}.mp4",
-        "file_size": getattr(doc, "file_size", 0),
-        "mime_type": getattr(doc, "mime_type", ""),
+        "file_size": file_size,
+        "mime_type": getattr(doc, "mime_type", "") or "",
         "file_id": getattr(doc, "file_id", ""),
         "duration": getattr(doc, "duration", 0),
         "width": getattr(doc, "width", 0),
         "height": getattr(doc, "height", 0),
     }
 
-    log.info(f"File info: {result['file_info']}")
-
-    # Check if it's encodable
     encodable_formats = {
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".mkv",
-        ".wmv",
-        ".flv",
-        ".webm",
-        ".m4v",
-        ".3gp",
-        ".ogv",
-        ".ts",
-        ".mts",
-        ".m2ts",
-        ".vob",
-        ".asf",
-        ".rm",
+        ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
+        ".3gp", ".ogv", ".ts", ".mts", ".m2ts", ".vob", ".asf", ".rm",
         ".rmvb",
     }
 
-    # Check by extension
     file_name = result["file_info"]["file_name"]
     if file_name:
         ext = os.path.splitext(file_name)[1].lower()
         if ext in encodable_formats:
             result["is_encodable"] = True
-            log.info(f"File is encodable by extension: {ext}")
 
-    # Check by MIME type
     mime_type = result["file_info"]["mime_type"]
     if mime_type and mime_type.startswith("video/"):
         result["is_encodable"] = True
-        log.info(f"File is encodable by MIME type: {mime_type}")
 
-    # Additional checks for encoding readiness
-    if result["is_encodable"]:
-        # Check file size (reasonable limits for encoding)
-        max_size = 2 * 1024 * 1024 * 1024  # 2GB limit
-        file_size = result["file_info"]["file_size"]
-        if 0 < file_size <= max_size:
-            result["encoding_ready"] = True
-            log.info(
-                f"File is ready for encoding (size: {file_size / (1024*1024):.2f} MB)"
-            )
+    if result["is_encodable"] and 0 < file_size <= MAX_FILE_SIZE:
+        result["encoding_ready"] = True
 
     return result
 
@@ -100,99 +70,102 @@ async def check_and_process_video_document(message: Message) -> dict:
     (filters.private) & (filters.document | filters.video | filters.audio)
 )
 async def enhanced_document_handler(client: Client, message: Message):
-    """
-    Enhanced document handler with detailed video analysis and proper error handling
-    """
     user_id = message.from_user.id
+
+    # Ban / maintenance gates (intake only; running jobs finish untouched).
+    if await is_banned(user_id):
+        await message.reply_text("🚫 <b>You are banned from using this bot.</b>")
+        return
+
+    from database import get_variable
+
+    if await get_variable("maintenance", False) and not await is_admin(user_id):
+        await message.reply_text(
+            "🛠 <b>Under maintenance</b>\n"
+            "<blockquote>The bot is not accepting new jobs right now. "
+            "Queued jobs are still being processed — try again soon!</blockquote>"
+        )
+        return
+
     log.info(f"Processing document/video from user {user_id}")
 
     # Log to Channel
     try:
         from bot.config import LOG_CHANNEL
+
         user = message.from_user
-        user_link = f"<a href='tg://user?id={user_id}'>{user.first_name}</a>"
+        doc = message.document or message.video
+        user_link = f"<a href='tg://user?id={user_id}'>{escape(user.first_name)}</a>"
         await client.send_message(
             LOG_CHANNEL,
             f"📥 <b>File Received</b>\n\n"
             f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
-            f"📄 <b>File:</b> <code>{getattr(message.document or message.video, 'file_name', 'Unknown')}</code>"
+            f"📄 <b>File:</b> <code>{escape(getattr(doc, 'file_name', 'Unknown') or 'Unknown')}</code>",
         )
     except Exception as e:
         log.error(f"Failed to send log to channel: {e}")
 
-    # Initialize variables for cleanup
     download_file_path = None
     download_msg = None
 
     try:
-        # Analyze the video document
         video_info = await check_and_process_video_document(message)
-        log.info(f"Video analysis result: {video_info}")
 
         if not video_info["is_video_document"]:
-            await message.reply_text("📄 This is not a video document.")
+            await message.reply_text(
+                "📄 That file isn't a video. Send MP4, MKV, AVI, MOV, WebM and similar."
+            )
             return
 
+        fi = video_info["file_info"]
         if not video_info["is_encodable"]:
             await message.reply_text(
-                "⚠️ **Video Document Detected**\n\n"
-                "This appears to be a video file, but it may not be suitable for encoding due to:\n"
-                "• Unsupported format\n"
-                "• File too large (>2GB)\n"
-                "• Missing metadata\n\n"
-                f"**File Info:**\n"
-                f"📁 Name: `{video_info['file_info']['file_name']}`\n"
-                f"📏 Size: `{video_info['file_info']['file_size'] / (1024*1024):.2f} MB`\n"
-                f"🏷️ Type: `{video_info['file_info']['mime_type']}`"
+                f"⚠️ <b>Can't encode this file</b>\n"
+                f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
+                f"📦 {(fi['file_size'] or 0) / (1024 * 1024):.2f} MB · "
+                f"🏷️ {escape(fi['mime_type']) or 'unknown type'}</blockquote>\n"
+                f"<i>Unsupported format or over the "
+                f"{MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>"
             )
             return
 
         if not video_info["encoding_ready"]:
             await message.reply_text(
-                "❌ **Video Not Ready for Encoding**\n\n"
-                "The video file is not ready for encoding. Please check:\n"
-                "• File size is within limits\n"
-                "• File is not corrupted\n"
-                "• Proper video format"
+                "❌ <b>File looks corrupted</b>\n"
+                "<i>Try re-uploading it. If it keeps failing, the source file may be broken.</i>"
             )
             return
 
-        # Video is ready for encoding
-        # Create download path
-        downloads_dir = Path("downloads")
+        downloads_dir = Path(DOWNLOAD_DIR)
         downloads_dir.mkdir(exist_ok=True)
 
-        file_name = video_info["file_info"]["file_name"]
-        # Sanitize filename
-        safe_filename = "".join(
-            c for c in file_name if c.isalnum() or c in (" ", "-", "_", ".")
-        ).strip()
-        if not safe_filename:
-            safe_filename = f"video_{int(time.time())}.mp4"
-
-        download_file_path = downloads_dir / safe_filename
+        safe_filename = sanitize_filename(fi["file_name"])
+        download_file_path = (
+            downloads_dir / f"{user_id}_{uuid.uuid4().hex[:6]}_{safe_filename}"
+        )
         log.info(f"Download path: {download_file_path}")
 
-        # Start download
-        download_msg = await message.reply_text("📥 **Downloading...**")
+        download_msg = await message.reply_text("📥 <b>Downloading...</b>")
         downloaded_path = await safe_download_media(
             client, message, str(download_file_path), download_msg
         )
 
         if not downloaded_path:
-            await download_msg.edit("❌ **Download Failed**")
+            try:
+                await download_msg.edit("❌ <b>Download failed.</b> Please try again.")
+            except Exception:
+                pass
             return
 
-        # Start encoding
-        # FFmpeg command is now generated dynamically based on user settings in bot/func/encode.py
-        # We pass an empty string or placeholder as it's ignored/overridden internally.
-
         if not os.path.exists(downloaded_path):
-            await download_msg.edit("❌ **Error:** File not found after download.")
+            try:
+                await download_msg.edit("❌ <b>Error:</b> file not found after download.")
+            except Exception:
+                pass
             return
 
         await encode(
-            ffmpeg_cmd="", # Ignored, uses User Settings
+            ffmpeg_cmd="",
             input_file=downloaded_path,
             client=client,
             user_id=user_id,
@@ -203,22 +176,23 @@ async def enhanced_document_handler(client: Client, message: Message):
 
     except Exception as e:
         log.error(f"Unexpected error in document handler for user {user_id}: {e}")
+        detail = escape(str(e))[:300]
         if download_msg:
-            await download_msg.edit(f"❌ **Error:** {str(e)}")
+            try:
+                await download_msg.edit(
+                    f"❌ <b>Something went wrong</b>\n<blockquote>{detail}</blockquote>"
+                )
+            except Exception:
+                pass
         else:
-            await message.reply_text(f"❌ **Error:** {str(e)}")
+            try:
+                await message.reply_text(f"❌ <b>Something went wrong</b>\n<blockquote>{detail}</blockquote>")
+            except Exception:
+                pass
 
-        # Cleanup if we failed before queuing (and file exists but wasn't queued)
-        # If queued, encode function handles cleanup
         if download_file_path and os.path.exists(download_file_path):
-            # We only clean up here if we didn't reach the encode call or it failed immediately
-            # But encode returns a dict, so we can check success?
-            # For now, let's just leave it, as encode handles its own cleanup
-            # if it fails internally.
             try:
                 os.remove(download_file_path)
                 log.info(f"Cleaned up file after error: {download_file_path}")
             except Exception as cleanup_error:
-                log.error(
-                    f"Failed to cleanup file {download_file_path}: {cleanup_error}"
-                )
+                log.error(f"Failed to cleanup file {download_file_path}: {cleanup_error}")

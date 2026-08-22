@@ -1,51 +1,126 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import asyncio
+
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
 try:
     from pyrogram.errors.pyromod.listener_timeout import ListenerTimeout
 except ImportError:
     from asyncio import TimeoutError as ListenerTimeout
 
+from bot.config import OWNER_ID
+from bot.decorator import invalidate_user_caches, is_admin
 from bot.logger import LOGGER, send_logs
 from bot.utils.restart import restart_bot
 from bot.utils.shell import shell_command
-from bot.config import OWNER_ID
 from database import full_userbase, del_user, get_variable, set_variable
 
 log = LOGGER(__name__)
 
 
-@Client.on_message(filters.command("restart"))
+@Client.on_message(filters.command("restart") & filters.private)
 async def handle_restart(client, message):
+    if message.from_user.id != OWNER_ID:
+        return
     try:
-        await message.reply_text("Restarting...")
+        await message.reply_text("🔄 Restarting...")
         await restart_bot(client, message)
     except Exception as e:
         log.error(e)
-        await message.reply_text(f"Error: {e}")
+        await message.reply_text(f"Error: <code>{e}</code>")
 
 
 @Client.on_message(filters.command("log") & filters.private)
 async def handle_logs(client, message):
+    if message.from_user.id != OWNER_ID:
+        return
     await send_logs(client, message)
 
 
-@Client.on_message(filters.command("shell"))
+@Client.on_message(filters.command("shell") & filters.private)
 async def handle_shell(client, message):
+    if message.from_user.id != OWNER_ID:
+        return
     await shell_command(client, message)
+
+
+@Client.on_message(filters.command("ban") & filters.private)
+async def ban_command(client, message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    target = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user.id
+    elif len(message.command) > 1:
+        try:
+            target = int(message.command[1])
+        except ValueError:
+            await message.reply_text("⚠️ Usage: <code>/ban USER_ID</code> or reply to a user.")
+            return
+
+    if not target or target == OWNER_ID:
+        await message.reply_text("❌ Invalid target (owner cannot be banned).")
+        return
+
+    banned = await get_variable("banned_users", [])
+    if target in banned:
+        await message.reply_text("⚠️ User is already banned.")
+        return
+
+    banned.append(target)
+    await set_variable("banned_users", banned)
+    invalidate_user_caches()
+    await message.reply_text(f"🚫 Banned <code>{target}</code>.")
+
+
+@Client.on_message(filters.command("unban") & filters.private)
+async def unban_command(client, message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    if len(message.command) < 2:
+        await message.reply_text("⚠️ Usage: <code>/unban USER_ID</code>")
+        return
+
+    try:
+        target = int(message.command[1])
+    except ValueError:
+        await message.reply_text("⚠️ Usage: <code>/unban USER_ID</code>")
+        return
+
+    banned = await get_variable("banned_users", [])
+    if target not in banned:
+        await message.reply_text("⚠️ User is not banned.")
+        return
+
+    banned.remove(target)
+    await set_variable("banned_users", banned)
+    invalidate_user_caches()
+    await message.reply_text(f"✅ Unbanned <code>{target}</code>.")
+
+
+@Client.on_message(filters.command("maint") & filters.private)
+async def maint_command(client, message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    current = await get_variable("maintenance", False)
+    new_state = not current
+    await set_variable("maintenance", new_state)
+    state_txt = "🛠 <b>Maintenance mode ENABLED</b>\n<i>New jobs are rejected; running jobs continue.</i>" if new_state else "✅ <b>Maintenance mode DISABLED</b>\n<i>The bot accepts new jobs again.</i>"
+    await message.reply_text(state_txt)
 
 
 @Client.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_command(client, message):
-    admin = await get_variable("admin", [])
-    userid = message.from_user.id
-    # If admin list is empty, allow owner (fallback)
-    if not admin:
-        if userid != OWNER_ID:
-            return
-    elif userid not in admin:
+    if not await is_admin(message.from_user.id):
         return
 
     if not message.reply_to_message:
@@ -84,7 +159,7 @@ async def broadcast_command(client, message):
         await pls_wait.edit("<i>⏰ Timed out. Please try again.</i>")
         return
 
-    await callback.answer()  # acknowledge the callback click
+    await callback.answer()
 
     pin = 1 if callback.data == "broadcast_pin" else 0
     await pls_wait.edit("<i>📤 Broadcast started...</i>")
@@ -103,7 +178,7 @@ async def broadcast_command(client, message):
             try:
                 sent = await broadcast_msg.copy(chat_id)
                 successful += 1
-            except BaseException:
+            except Exception:
                 unsuccessful += 1
         except UserIsBlocked:
             await del_user(chat_id)
@@ -143,7 +218,11 @@ async def admin(client, message):
         return
 
     a = await get_variable("admin", [])
-    txt = f"<blockquote expandable>💠 𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋  ♻️\n</blockquote>\n<blockquote expandable>🚩 𝐀𝐃𝐌𝐈𝐍 :- {a}\n</blockquote>\n<blockquote expandable>⚠️ 𝐍𝐎𝐓𝐄 - ADMINS CAN USE ALL BOT COMMMANDS EXCEPT FSUB, ADMIN ‼️</blockquote>"
+    txt = (
+        f"<blockquote expandable>💠 𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋  ♻️\n</blockquote>\n"
+        f"<blockquote expandable>🚩 𝐀𝐃𝐌𝐈𝐍 :- {a}\n</blockquote>\n"
+        f"<blockquote expandable>⚠️ 𝐍𝐎𝐓𝐄 - ADMINS CAN USE ALL BOT COMMANDS EXCEPT FSUB, ADMIN ‼️</blockquote>"
+    )
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -162,6 +241,20 @@ async def admin(client, message):
     )
 
 
+async def _parse_target_input(a):
+    """Returns (chat_id, error) from a listened message."""
+    if a.forward_from:
+        return a.forward_from.id, None
+    if a.forward_from_chat:
+        return a.forward_from_chat.id, None
+    if not a.text:
+        return None, "Please send a valid user ID (text or forward)."
+    try:
+        return int(a.text.strip()), None
+    except ValueError:
+        return None, "Invalid input! Please send a valid user ID."
+
+
 @Client.on_callback_query(filters.regex("^admin_"))
 async def admin2(client, query):
     uid = query.from_user.id
@@ -173,7 +266,6 @@ async def admin2(client, query):
         )
         return
 
-    # Extract "add" or "rem" from the callback data
     action = query.data.split("_")[1]
 
     txt = (
@@ -212,37 +304,28 @@ async def admin2(client, query):
                 await b.delete()
                 break
 
-            chat_id = None
-            if a.forward_from:
-                chat_id = a.forward_from.id
-            elif a.forward_from_chat:
-                chat_id = a.forward_from_chat.id
-            else:
-                try:
-                    chat_id = int(a.text.strip())
-                except ValueError:
-                    await client.send_message(
-                        user_id, "Invalid input! Please send a valid user ID."
-                    )
-                    await b.delete()
-                    continue
+            chat_id, err = await _parse_target_input(a)
+            if err:
+                await client.send_message(user_id, err)
+                await b.delete()
+                continue
 
             admin1 = await get_variable("admin", [])
 
             if chat_id in admin1:
-                await client.send_message(
-                    user_id, "User is already admin resend correct id...."
-                )
+                await client.send_message(user_id, "User is already admin; resend a correct ID...")
                 await b.delete()
                 continue
             admin1.append(chat_id)
 
             await set_variable("admin", admin1)
+            invalidate_user_caches()
             await b.delete()
             await client.send_message(
-                user_id, f"✅ User {chat_id} added to admins.", reply_markup=ReplyKeyboardRemove()
+                user_id,
+                f"✅ User {chat_id} added to admins.",
+                reply_markup=ReplyKeyboardRemove(),
             )
-            # Refresh panel
             await admin(client, query.message)
             await query.message.delete()
             break
@@ -276,37 +359,28 @@ async def admin2(client, query):
                 await b.delete()
                 break
 
-            chat_id = None
-            if a.forward_from:
-                chat_id = a.forward_from.id
-            elif a.forward_from_chat:
-                chat_id = a.forward_from_chat.id
-            else:
-                try:
-                    chat_id = int(a.text.strip())
-                except ValueError:
-                    await client.send_message(
-                        user_id, "Invalid input! Please send a valid user ID."
-                    )
-                    await b.delete()
-                    continue
+            chat_id, err = await _parse_target_input(a)
+            if err:
+                await client.send_message(user_id, err)
+                await b.delete()
+                continue
 
             admin1 = await get_variable("admin", [])
 
             if chat_id not in admin1:
-                await client.send_message(
-                    user_id, "User is not admin resend correct id...."
-                )
+                await client.send_message(user_id, "User is not admin; resend a correct ID....")
                 await b.delete()
                 continue
             admin1.remove(chat_id)
 
             await set_variable("admin", admin1)
+            invalidate_user_caches()
             await b.delete()
             await client.send_message(
-                user_id, f"✅ User {chat_id} removed from admins.", reply_markup=ReplyKeyboardRemove()
+                user_id,
+                f"✅ User {chat_id} removed from admins.",
+                reply_markup=ReplyKeyboardRemove(),
             )
-            # Refresh panel
             await admin(client, query.message)
             await query.message.delete()
             break

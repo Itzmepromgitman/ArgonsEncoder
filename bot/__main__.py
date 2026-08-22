@@ -1,10 +1,26 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import asyncio
+import glob
+import os
+import shutil
+import sys
 
 from pyrogram import Client
+from pyrogram.types import BotCommand
 
-
-from bot.config import API_HASH, APP_ID, TG_BOT_TOKEN, TG_BOT_WORKERS
+from bot.config import (
+    API_HASH,
+    APP_ID,
+    DOWNLOAD_DIR,
+    MAX_CONCURRENT_TRANSMISSIONS,
+    OWNER_ID,
+    PORT,
+    SESSION_DB_KEY,
+    TG_BOT_TOKEN,
+    TG_BOT_WORKERS,
+    THUMB_DIR,
+    WATERMARK_DIR,
+)
 from database import get_variable, set_variable
 
 from .logger import LOGGER, tg_handler
@@ -13,72 +29,114 @@ log = LOGGER(__name__)
 
 
 async def get_session():
-    return await get_variable(TG_BOT_TOKEN, None)
+    try:
+        return await get_variable(SESSION_DB_KEY, None)
+    except Exception as e:
+        log.warning(f"Could not load stored session: {e}")
+        return None
+
+
+async def _start_health_server():
+    """Serve a tiny keep-alive endpoint on 0.0.0.0:$PORT inside the bot loop."""
+    try:
+        from aiohttp import web
+
+        from bot.server import web_server
+
+        runner = web.AppRunner(await web_server())
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(PORT))
+        await site.start()
+        log.info(f"Health server listening on 0.0.0.0:{PORT}")
+    except Exception as e:
+        log.error(f"Health server failed to start: {e}")
+
+
+def _startup_cleanup():
+    """Wipe transient working dirs to prevent disk bloat across restarts."""
+    try:
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    except Exception as e:
+        log.error(f"Failed to cleanup {DOWNLOAD_DIR}: {e}")
+
+    try:
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        for pattern in ("auto_*.jpg", "*.tmp"):
+            for p in glob.glob(os.path.join(THUMB_DIR, pattern)):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error(f"Thumb cleanup failed: {e}")
+
+    try:
+        for p in glob.glob(os.path.join(WATERMARK_DIR, "preview_*.jpg")):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    except Exception as e:
+        log.error(f"Watermark cleanup failed: {e}")
+
+    log.info("Startup cleanup complete")
 
 
 class Bot(Client):
     def __init__(self):
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Try to reuse a persisted user session; fall back to the bot account.
+        session = None
+        if sys.platform != "win32":
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            try:
+                session = loop.run_until_complete(get_session())
+            except Exception as e:
+                log.warning(f"Session fetch failed, using bot login: {e}")
 
-        session = loop.run_until_complete(get_session())
+        common = dict(
+            api_id=APP_ID,
+            api_hash=API_HASH,
+            plugins={"root": "plugins"},
+            workers=TG_BOT_WORKERS,
+            max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+        )
 
         if session:
-            # User session
-            super().__init__(
-                name="user_session",
-                session_string=session,
-                api_id=APP_ID,
-                api_hash=API_HASH,
-                plugins={"root": "plugins"},
-                workers=TG_BOT_WORKERS,
-                max_concurrent_transmissions=8,
-            )
+            super().__init__(name="user_session", session_string=session, **common)
         else:
-            # Bot session
             super().__init__(
-                name="bot_session",
-                api_id=APP_ID,
-                api_hash=API_HASH,
-                bot_token=TG_BOT_TOKEN,
-                plugins={"root": "plugins"},
-                workers=TG_BOT_WORKERS,
-                max_concurrent_transmissions=8,
+                name="bot_session", bot_token=TG_BOT_TOKEN, **common
             )
 
     async def start(self):
         await super().start()
         tg_handler.client = self
 
-        # Startup Cleanup
-        try:
-            import shutil
-            import os
-            if os.path.exists("downloads"):
-                shutil.rmtree("downloads")
-                os.makedirs("downloads")
-                log.info("Cleaned up downloads directory")
-        except Exception as e:
-            log.error(f"Failed to cleanup downloads: {e}")
+        _startup_cleanup()
+        await _start_health_server()
 
         try:
             await self.send_message(
-                7024179022,
+                OWNER_ID,
                 text="<b><blockquote>🤖 Bᴏᴛ Rᴇsᴛᴀʀᴛᴇᴅ Sᴜᴄᴄᴇssғᴜʟʟʏ</blockquote></b>",
             )
         except BaseException:
             pass
+
         log.info(
             """
       ___      _____    _____   ____   _   _
-     /   \    |  __ \  / ____| / __ \ | \ | |
-    /  ^  \   | |__) || |  __ | |  | ||  \| |
-   /  /_\  \  |  _  / | | |_ || |  | || . ` |
-  /  _____  \ | | \ \ | |__| || |__| || |\  |
- /__/     \__\|_|  \_\ \_____| \____/ |_| \_|
+     /   \\    |  __ \\  / ____| / __ \\ | \\ | |
+    /  ^  \\   | |__) || |  __ | |  | ||  \\| |
+   /  /_\\  \\  |  _  / | | |_ || |  | || . ` |
+  /  _____  \\ | | \\ \\ | |__| || |__| || |\\  |
+ /__/     \\__\\|_|  \\_\\ \\_____| \\_____| |_| \\_|
  |__|     |__|
 
     Developed by ARGON telegram: @REACTIVEARGON
@@ -86,34 +144,8 @@ class Bot(Client):
         )
         log.info("Argons Encoder started successfully")
 
-        # Set Bot Commands
-        try:
-            from pyrogram.types import BotCommand
-
-            await self.set_bot_commands(
-                [
-                    BotCommand("start", "Start the bot"),
-                    BotCommand("settings", "Configure user settings"),
-                    BotCommand("queue", "Show current job queue"),
-                    BotCommand("stats", "View bot statistics"),
-                    BotCommand("ss", "Generate screenshots from video"),
-                    BotCommand("cancel", "Cancel a specific job"),
-                    BotCommand("clear", "Clear your jobs"),
-                    BotCommand("cancelall", "Cancel ALL jobs (Admin Only)"),
-                    BotCommand("restart", "Restart the bot (Admin Only)"),
-                    BotCommand("shell", "Run shell commands (Admin Only)"),
-                    BotCommand("log", "Get logs (Admin Only)"),
-                    BotCommand("info", "Get job info (Admin Only)"),
-                    BotCommand("broadcast", "Broadcast message (Admin Only)"),
-                    BotCommand("admin", "Admin Panel (Owner Only)"),
-                    BotCommand("help", "Get help"),
-                ]
-            )
-            log.info("Bot commands set successfully")
-        except Exception as e:
-            log.error(f"Failed to set bot commands: {e}")
-
-        # Restore Queue
+        # Restore queue immediately after the client is live so restored jobs
+        # are known before user traffic flows in.
         try:
             from bot.func.queue_manager import queue_manager
 
@@ -121,19 +153,50 @@ class Bot(Client):
         except Exception as e:
             log.error(f"Failed to restore queue: {e}")
 
-        session = await self.export_session_string()
-        await set_variable(TG_BOT_TOKEN, session)
+        # Set Bot Commands
+        try:
+            await self.set_bot_commands(
+                [
+                    BotCommand("start", "Start the bot"),
+                    BotCommand("settings", "Configure encoding settings"),
+                    BotCommand("queue", "Show your job queue"),
+                    BotCommand("status", "Live server status"),
+                    BotCommand("stats", "Bot statistics"),
+                    BotCommand("ss", "Generate screenshots from video"),
+                    BotCommand("cancel", "Cancel a job by ID"),
+                    BotCommand("clear", "Clear your queued jobs"),
+                    BotCommand("help", "How to use the bot"),
+                ]
+            )
+            log.info("Bot commands set successfully")
+        except Exception as e:
+            log.error(f"Failed to set bot commands: {e}")
 
-    async def send_msg(self, chat, text):
-        await self.send_message(int(chat), text)
+        # Persist a user session so restarts keep the same identity.
+        try:
+            session = await self.export_session_string()
+            await set_variable(SESSION_DB_KEY, session)
+        except Exception as e:
+            log.debug(f"Session export skipped: {e}")
+
+    async def stop(self, *args, **kwargs):
+        # Persist final queue state before disconnecting.
+        try:
+            from bot.func.queue_manager import queue_manager
+
+            await queue_manager.shutdown()
+        except Exception as e:
+            log.error(f"Shutdown save failed: {e}")
+        await super().stop(*args, **kwargs)
 
 
 if __name__ == "__main__":
-    try:
-        import uvloop
+    if sys.platform != "win32":
+        try:
+            import uvloop
 
-        uvloop.install()
-    except ImportError:
-        pass
+            uvloop.install()
+        except ImportError:
+            pass
     bot = Bot()
     bot.run()

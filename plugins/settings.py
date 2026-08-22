@@ -1,24 +1,45 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import asyncio
+import copy
 import os
+from html import escape
+
 from pyrogram import Client, filters
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
+try:
+    from pyrogram.errors.pyromod.listener_timeout import ListenerTimeout
+except ImportError:
+    from asyncio import TimeoutError as ListenerTimeout
+
 from bot.decorator import task
-from bot.func.ffmpeg_utils import validate_ffmpeg_command
+from bot.func.ffmpeg_utils import (
+    VALID_AUDIO_CODECS,
+    VALID_CODECS,
+    VALID_PRESETS,
+    sanitize_custom_name,
+    validate_ffmpeg_command,
+)
 from bot.logger import LOGGER
 from database import get_user_settings, update_user_settings
 
 log = LOGGER(__name__)
 
-# Global state for user inputs
-# Format: {user_id: {"type": "setting_key", "message_id": int, "data": any}}
-# INPUT_STATE = {}  <-- Removed in favor of client.listen
-
 # Default Settings
 DEFAULT_SETTINGS = {
-    "video": {"crf": "23", "preset": "medium", "resolution": ["1080p"], "codec": "mpeg4"},
-    "audio": {"bitrate": "128k"},
+    "video": {
+        "crf": "23",
+        "preset": "medium",
+        "resolution": ["1080p"],
+        "codec": "libx264",
+        "subtitle_mode": "copy",   # copy | drop
+        "sample_seconds": 0,       # 0 = off; else first N seconds only
+        "remux": False,            # stream-copy container fix mode
+        "trim_start": 0,
+        "trim_end": 0,
+    },
+    "audio": {"bitrate": "128k", "codec": "aac", "track": "all"},
     "metadata": {
         "global": {"title": "Auto Encoded", "author": "AutoAnimePro"},
         "video": {},
@@ -26,7 +47,21 @@ DEFAULT_SETTINGS = {
         "subtitle": {},
     },
     "custom_ffmpeg": {},
+    "rename": {"pattern": ""},
+    "output_as_video": False,
 }
+
+
+async def safe_edit(message, text, reply_markup=None):
+    """Edit text tolerating identical content."""
+    try:
+        await message.edit_text(text=text, reply_markup=reply_markup)
+        return True
+    except MessageNotModified:
+        return False
+    except Exception as e:
+        log.error(f"safe_edit failed: {e}")
+        return False
 
 METADATA_KEYS = {
     "global": [
@@ -71,18 +106,25 @@ async def settings_command(client, message, query=False):
         await update_user_settings(user_id, settings)
 
     res_display = ", ".join(settings.get("video", {}).get("resolution", ["1080p"]))
+    v = settings.get("video", {})
+    a = settings.get("audio", {})
+
+    remux_chip = "⚡ Remux" if v.get("remux") else "🎞 Re-encode"
+    sample = int(v.get("sample_seconds", 0) or 0)
+    sample_chip = f"⏱ Sample {sample}s" if sample else "🎞 Full"
+    sub_mode = v.get("subtitle_mode", "copy")
+    out_chip = "📤 As video" if settings.get("output_as_video") else "📄 As document"
 
     text = (
         f"<b>⚙️ User Settings</b>\n\n"
-        f"<blockquote><b>Video:</b>\n"
-        f"• Codec: <code>{settings.get('video', {}).get('codec', 'mpeg4')}</code>\n"
-        f"• CRF: <code>{settings.get('video', {}).get('crf', '23')}</code>\n"
-        f"• Preset: <code>{settings.get('video', {}).get('preset', 'medium')}</code>\n"
-        f"• Resolution: <code>{res_display}</code>\n\n"
-        f"<b>Audio:</b>\n"
-        f"• Bitrate: <code>{settings.get('audio', {}).get('bitrate', '128k')}</code>\n\n"
-        f"<b>Metadata:</b>\n"
-        f"• Global Title: <code>{settings.get('metadata', {}).get('global', {}).get('title', 'N/A')}</code></blockquote>"
+        f"<blockquote>🎬 <code>{escape(str(v.get('codec', 'libx264')))}</code> · "
+        f"CRF <code>{escape(str(v.get('crf', '23')))}</code> · "
+        f"<code>{escape(str(v.get('preset', 'medium')))}</code>\n"
+        f"📐 {escape(res_display)} · {remux_chip} · {sample_chip}\n"
+        f"🎵 {escape(str(a.get('codec', 'aac')))} {escape(str(a.get('bitrate', '128k')))} · "
+        f"track {escape(str(a.get('track', 'all')))}\n"
+        f"💬 Subs: {escape(str(sub_mode))} · {out_chip}\n"
+        f"📝 Title: <code>{escape(str(settings.get('metadata', {}).get('global', {}).get('title', 'N/A')))}</code></blockquote>"
     )
 
     buttons = InlineKeyboardMarkup(
@@ -98,6 +140,9 @@ async def settings_command(client, message, query=False):
             [
                 InlineKeyboardButton("💧 Watermark", callback_data="set_watermark"),
                 InlineKeyboardButton("🖼️ Thumbnail", callback_data="set_thumbnail"),
+            ],
+            [
+                InlineKeyboardButton("➕ More", callback_data="set_more"),
             ],
             [InlineKeyboardButton("❌ Close", callback_data="cb_close")],
         ]
@@ -124,29 +169,50 @@ async def settings_callback(client, callback_query: CallbackQuery):
     settings = await get_user_settings(user_id)
 
     if data == "set_video":
+        v = settings.get("video", {})
+        sample = int(v.get("sample_seconds", 0) or 0)
+        remux = bool(v.get("remux", False))
+        sub_mode = v.get("subtitle_mode", "copy")
+
         text = "<b>🎬 Video Settings</b>\n\nSelect a parameter to edit:"
         buttons = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        f"Codec ({settings.get('video', {}).get('codec', 'mpeg4')})",
+                        f"Codec: {settings.get('video', {}).get('codec', 'libx264')} ▸",
                         callback_data="edit_video_codec",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        f"CRF ({settings.get('video', {}).get('crf', '23')})",
+                        f"CRF: {settings.get('video', {}).get('crf', '23')} ▸",
                         callback_data="edit_video_crf",
                     ),
                     InlineKeyboardButton(
-                        f"Preset ({settings.get('video', {}).get('preset', 'medium')})",
+                        f"Preset: {settings.get('video', {}).get('preset', 'medium')} ▸",
                         callback_data="edit_video_preset",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
-                        "Resolution (Multi)", callback_data="edit_video_res"
+                        "Resolution (Multi) ▸", callback_data="edit_video_res"
                     )
+                ],
+                [
+                    InlineKeyboardButton(
+                        ("⚡ Remux: ON" if remux else "🎞 Re-encode"),
+                        callback_data="toggle_video_remux",
+                    ),
+                    InlineKeyboardButton(
+                        (f"⏱ Sample: {sample}s" if sample else "⏱ Sample: off"),
+                        callback_data="edit_video_sample",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"💬 Subs: {sub_mode}",
+                        callback_data="toggle_video_subs",
+                    ),
                 ],
                 [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
             ]
@@ -154,13 +220,60 @@ async def settings_callback(client, callback_query: CallbackQuery):
         await message.edit_text(text=text, reply_markup=buttons)
 
     elif data == "set_audio":
+        a = settings.get("audio", {})
         text = "<b>🎵 Audio Settings</b>\n\nSelect a parameter to edit:"
         buttons = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        f"Bitrate ({settings.get('audio', {}).get('bitrate', '128k')})",
+                        f"Bitrate: {a.get('bitrate', '128k')} ▸",
                         callback_data="edit_audio_bitrate",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"Codec: {a.get('codec', 'aac')} ▸",
+                        callback_data="edit_audio_codec",
+                    ),
+                    InlineKeyboardButton(
+                        f"Track: {a.get('track', 'all')} ▸",
+                        callback_data="edit_audio_track",
+                    ),
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
+            ]
+        )
+        await message.edit_text(text=text, reply_markup=buttons)
+
+    elif data == "set_more":
+        trim = settings.get("video", {})
+        t_start = float(trim.get("trim_start", 0) or 0)
+        t_end = float(trim.get("trim_end", 0) or 0)
+        rename = (settings.get("rename", {}) or {}).get("pattern", "")
+        as_video = bool(settings.get("output_as_video", False))
+
+        trim_chip = (
+            f"{t_start:.0f}s → {t_end:.0f}s"
+            if t_end > t_start > 0
+            else (f"from {t_start:.0f}s" if t_start > 0 else "off")
+        )
+
+        text = "<b>➕ More Options</b>\n\nFine-tune how your encodes behave:"
+        buttons = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(f"✂️ Trim: {trim_chip}", callback_data="edit_trim"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"✏️ Rename: {(rename[:14] + '…') if len(rename) > 16 else (rename or 'off')}",
+                        callback_data="edit_rename",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        ("📤 Output: video" if as_video else "📄 Output: document"),
+                        callback_data="toggle_output_mode",
                     )
                 ],
                 [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
@@ -192,7 +305,7 @@ async def settings_callback(client, callback_query: CallbackQuery):
         cmds_buttons = []
         if custom_cmds:
             for name, cmd in custom_cmds.items():
-                text += f"• <b>{name}</b>: <code>{cmd}</code>\n"
+                text += f"• <b>{escape(str(name))}</b>: <code>{escape(str(cmd))}</code>\n"
                 cmds_buttons.append(
                     [
                         InlineKeyboardButton(
@@ -268,53 +381,48 @@ async def settings_callback(client, callback_query: CallbackQuery):
 
         await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
 
-    elif data.startswith("set_meta_cat_"):
-        category = data.replace("set_meta_cat_", "")
-        page = 0
-        if "|" in category:
-            category, page = category.split("|")
-            page = int(page)
 
-        keys = METADATA_KEYS.get(category, [])
-        total_keys = len(keys)
-        per_page = 10
-        total_pages = (total_keys + per_page - 1) // per_page
 
-        start = page * per_page
-        end = start + per_page
-        current_keys = keys[start:end]
+@Client.on_callback_query(filters.regex(r"^(toggle_video_remux|toggle_video_subs|toggle_output_mode)$"))
+async def toggle_simple_callback(client, callback_query: CallbackQuery):
+    data = callback_query.data
+    user_id = callback_query.from_user.id
 
-        text = f"<b>📝 {category.capitalize()} Metadata</b>\n\nSelect a key to edit (Page {page+1}/{total_pages}):"
+    settings = await get_user_settings(user_id)
+    if not settings:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+    v = settings.setdefault("video", {})
 
-        buttons = []
-        # Create 2 columns
-        row = []
-        for key in current_keys:
-            # Check if value is set
-            val = settings.get("metadata", {}).get(category, {}).get(key, "")
-            icon = "✏️" if val else "➕"
-            label = f"{icon} {key}"
+    if data == "toggle_video_remux":
+        v["remux"] = not bool(v.get("remux", False))
+        note = "⚡ Remux ON — streams are copied without re-encoding (watermark/scale/CRF ignored)."
+        if not v["remux"]:
+            note = "🎞 Re-encode restored."
+        await update_user_settings(user_id, settings)
+        await callback_query.answer("✅ Updated")
 
-            row.append(InlineKeyboardButton(label, callback_data=f"edit_meta_val_{category}|{key}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
+    elif data == "toggle_video_subs":
+        v["subtitle_mode"] = "drop" if v.get("subtitle_mode", "copy") == "copy" else "copy"
+        note = (
+            "💬 Subtitles will be dropped."
+            if v["subtitle_mode"] == "drop"
+            else "💬 Subtitles will be copied."
+        )
+        await update_user_settings(user_id, settings)
+        await callback_query.answer("✅ Updated")
 
-        # Navigation
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"set_meta_cat_{category}|{page-1}"))
-        if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"set_meta_cat_{category}|{page+1}"))
+    else:  # toggle_output_mode
+        settings["output_as_video"] = not bool(settings.get("output_as_video", False))
+        note = (
+            "📤 Output will be sent as a streamable video."
+            if settings["output_as_video"]
+            else "📄 Output will be sent as a document."
+        )
+        await update_user_settings(user_id, settings)
+        await callback_query.answer("✅ Updated")
 
-        if nav_row:
-            buttons.append(nav_row)
-
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_meta")])
-
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+    callback_query.data = "set_video" if data != "toggle_output_mode" else "set_more"
+    await settings_callback(client, callback_query)
 
 
 @Client.on_callback_query(filters.regex("^edit_"))
@@ -324,6 +432,8 @@ async def edit_callback(client, callback_query: CallbackQuery):
     message = callback_query.message
 
     settings = await get_user_settings(user_id)
+    if not settings:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
 
     if data == "edit_video_res":
         current_res = settings.get("video", {}).get("resolution", ["1080p"])
@@ -345,244 +455,190 @@ async def edit_callback(client, callback_query: CallbackQuery):
 
         buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_video")])
 
-        await message.edit_text(
-            text="<b>Select Resolutions:</b>\n<i>Click to toggle multiple.</i>",
-            reply_markup=InlineKeyboardMarkup(buttons),
+        await safe_edit(
+            message,
+            "<b>Select Resolutions:</b>\n<i>Click to toggle multiple.</i>",
+            InlineKeyboardMarkup(buttons),
         )
         return
 
-
-
-    prompt = ""
-    if data == "edit_video_codec":
-        prompt = "<b>Enter new Video Codec:</b>\n<i>Examples: libx264, libx265, libvpx-vp9, libaom-av1, mpeg4</i>"
-    elif data == "edit_video_crf":
-        prompt = "<b>Enter new CRF value (0-51):</b>\n<i>Lower is better quality. Default: 23</i>"
-    elif data == "edit_video_preset":
-        prompt = "<b>Enter new Preset:</b>\n<i>(ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)</i>"
-    elif data == "edit_audio_bitrate":
-        prompt = "<b>Enter new Audio Bitrate:</b>\n<i>Example: 128k, 192k, 320k</i>"
-    elif data.startswith("edit_meta_val_"):
+    prompts = {
+        "edit_video_codec": "<b>Enter new Video Codec:</b>\n<i>Valid: "
+        + ", ".join(sorted(VALID_CODECS))
+        + "</i>",
+        "edit_video_crf": "<b>Enter new CRF value (0-51):</b>\n<i>Lower is better quality. Default: 23</i>",
+        "edit_video_preset": "<b>Enter new Preset:</b>\n<i>(ultrafast … veryslow)</i>",
+        "edit_audio_bitrate": "<b>Enter new Audio Bitrate:</b>\n<i>Example: 128k, 192k, 320k</i>",
+        "edit_audio_codec": "<b>Enter new Audio Codec:</b>\n<i>Valid: "
+        + ", ".join(sorted(VALID_AUDIO_CODECS))
+        + "</i>",
+        "edit_audio_track": "<b>Enter audio track choice:</b>\n<i>all / none / track number (e.g. 1)</i>",
+        "edit_video_sample": "<b>Sample encode length (seconds):</b>\n<i>0 = off, or 10–600. Encodes only the first N seconds to test settings.</i>",
+        "edit_trim": "<b>Trim window:</b>\n<i>Send: <code>start end</code> in seconds (e.g. <code>10 120</code>).\nSend <code>off</code> to disable trimming.</i>",
+        "edit_rename": "<b>Rename output files:</b>\n<i>Pattern tokens: {original} {res} {codec} {date}\nExample: <code>{original} [{res}]</code>\nSend <code>off</code> to disable renaming.</i>",
+    }
+    if data.startswith("edit_meta_val_"):
         category, key = data.split("_", 3)[-1].split("|")
         prompt = f"<b>Enter value for {category} metadata '{key}':</b>\n<i>Send 'clear' to remove.</i>"
-
-    # Use client.listen for input
-    prompt_msg = await message.edit_text(text=prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
-
-    try:
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
-        text = input_msg.text
-        await input_msg.delete()
-    except Exception:
-        await prompt_msg.delete()
-        return
-
-    # Process Input
-    if data == "edit_video_codec":
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["codec"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Codec set to <code>{text}</code>")
-
-    elif data == "edit_video_crf":
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["crf"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ CRF set to <code>{text}</code>")
-
-    elif data == "edit_video_preset":
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["preset"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Preset set to <code>{text}</code>")
-
-    elif data == "edit_audio_bitrate":
-        if "audio" not in settings: settings["audio"] = {}
-        settings["audio"]["bitrate"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Audio Bitrate set to <code>{text}</code>")
-
-    elif data.startswith("edit_meta_val_"):
-        category, key = data.split("_", 3)[-1].split("|")
-
-        if "metadata" not in settings: settings["metadata"] = {}
-        if category not in settings["metadata"]: settings["metadata"][category] = {}
-
-        if text.lower() == "clear":
-            if key in settings["metadata"][category]:
-                del settings["metadata"][category][key]
-            await message.reply_text(f"🗑 Cleared {category} metadata <b>{key}</b>")
-        else:
-            settings["metadata"][category][key] = text
-            await message.reply_text(f"✅ Set {category} metadata <b>{key}</b> to <code>{text}</code>")
-
-        await update_user_settings(user_id, settings)
-
-        # Return to category menu
-        callback_query.data = f"set_meta_cat_{category}"
-        await settings_callback(client, callback_query)
-        return
-
-    # Return to main menu
-    await settings_command(client, message, query=True)
-
-
-@Client.on_callback_query(filters.regex("^toggle_res_"))
-async def toggle_res_callback(client, callback_query: CallbackQuery):
-    res = callback_query.data.replace("toggle_res_", "")
-    user_id = callback_query.from_user.id
-
-    settings = await get_user_settings(user_id)
-    if "video" not in settings:
-        settings["video"] = {}
-
-    current_res = settings["video"].get("resolution", ["1080p"])
-    if isinstance(current_res, str):
-        current_res = [current_res]
-
-    if res in current_res:
-        if len(current_res) > 1:  # Prevent removing the last one
-            current_res.remove(res)
     else:
-        current_res.append(res)
+        prompt = prompts.get(data)
 
-    settings["video"]["resolution"] = current_res
-    await update_user_settings(user_id, settings)
-
-    # Refresh menu
-    callback_query.data = "edit_video_res"
-    await edit_callback(client, callback_query)
-
-
-
-
-
-
-
-@Client.on_callback_query(filters.regex("^edit_"))
-async def edit_callback(client, callback_query: CallbackQuery):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    message = callback_query.message
-
-    settings = await get_user_settings(user_id)
-
-    if data == "edit_video_res":
-        current_res = settings.get("video", {}).get("resolution", ["1080p"])
-        if isinstance(current_res, str):
-            current_res = [current_res]
-
-        all_res = ["1080p", "720p", "480p", "360p"]
-
-        buttons = []
-        for res in all_res:
-            icon = "☑️" if res in current_res else "⬜"
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"{icon} {res}", callback_data=f"toggle_res_{res}"
-                    )
-                ]
-            )
-
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_video")])
-
-        await message.edit_text(
-            text="<b>Select Resolutions:</b>\n<i>Click to toggle multiple.</i>",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+    if not prompt:
+        await callback_query.answer()
         return
 
-    # Set input state
-    # INPUT_STATE[user_id] = {"type": data, "message_id": message.id} # Removed
-
-    prompt = ""
-    if data == "edit_video_codec":
-        prompt = "<b>Enter new Video Codec:</b>\n<i>Examples: libx264, libx265, libvpx-vp9, libaom-av1, mpeg4</i>"
-    elif data == "edit_video_crf":
-        prompt = "<b>Enter new CRF value (0-51):</b>\n<i>Lower is better quality. Default: 23</i>"
-    elif data == "edit_video_preset":
-        prompt = "<b>Enter new Preset:</b>\n<i>(ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)</i>"
-    elif data == "edit_audio_bitrate":
-        prompt = "<b>Enter new Audio Bitrate:</b>\n<i>Example: 128k, 192k, 320k</i>"
-    elif data.startswith("edit_meta_val_"):
-        category, key = data.split("_", 3)[-1].split("|")
-        prompt = f"<b>Enter value for {category} metadata '{key}':</b>\n<i>Send 'clear' to remove.</i>"
-
-    # Use client.listen for input
-    prompt_msg = await message.edit_text(text=prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
-
+    prompt_msg = None
     try:
+        prompt_msg = await message.edit_text(
+            text=prompt,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]
+            ),
+        )
         input_msg = await client.listen(chat_id=user_id, timeout=60)
         text = input_msg.text
         await input_msg.delete()
-    except asyncio.TimeoutError:
-        await prompt_msg.delete()
+    except ListenerTimeout:
+        if prompt_msg:
+            try:
+                await prompt_msg.delete()
+            except Exception:
+                pass
         await message.reply_text("❌ Timed out.")
         return
     except Exception:
-        # Cancelled
-        await settings_command(client, message, query=True)
+        if prompt_msg:
+            try:
+                await prompt_msg.delete()
+            except Exception:
+                pass
+        callback_query.data = "set_main"
+        await settings_callback(client, callback_query)
         return
 
-    # Process Input
-    # Process Input
+    if not text:
+        await message.reply_text("❌ Please send text (or press Cancel).")
+        return
+
+    async def invalid(msg: str):
+        await message.reply_text(f"❌ <b>Invalid!</b>\n{msg}")
+        callback_query.data = "set_main"
+        await settings_callback(client, callback_query)
+
     if data == "edit_video_codec":
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["codec"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Codec set to <code>{text}</code>")
+        if text.strip() not in VALID_CODECS:
+            await invalid("Choose one of: " + ", ".join(sorted(VALID_CODECS)))
+            return
+        settings.setdefault("video", {})["codec"] = text.strip()
 
     elif data == "edit_video_crf":
         if not text.isdigit() or not (0 <= int(text) <= 51):
-            await message.reply_text("❌ <b>Invalid CRF!</b>\nPlease enter a number between 0 and 51.")
+            await invalid("Please enter a number between 0 and 51.")
             return
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["crf"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ CRF set to <code>{text}</code>")
+        settings.setdefault("video", {})["crf"] = text
 
     elif data == "edit_video_preset":
-        valid_presets = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
-        if text.lower() not in valid_presets:
-             await message.reply_text(f"❌ <b>Invalid Preset!</b>\nChoose from: {', '.join(valid_presets)}")
-             return
-        if "video" not in settings: settings["video"] = {}
-        settings["video"]["preset"] = text.lower()
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Preset set to <code>{text}</code>")
+        if text.lower() not in VALID_PRESETS:
+            await invalid("Choose from: " + ", ".join(VALID_PRESETS))
+            return
+        settings.setdefault("video", {})["preset"] = text.lower()
 
     elif data == "edit_audio_bitrate":
         if not text.endswith("k") or not text[:-1].isdigit():
-             await message.reply_text("❌ <b>Invalid Bitrate!</b>\nFormat: 128k, 192k, etc.")
-             return
-        if "audio" not in settings: settings["audio"] = {}
-        settings["audio"]["bitrate"] = text
-        await update_user_settings(user_id, settings)
-        await message.reply_text(f"✅ Audio Bitrate set to <code>{text}</code>")
+            await invalid("Format: 128k, 192k, etc.")
+            return
+        settings.setdefault("audio", {})["bitrate"] = text
+
+    elif data == "edit_audio_codec":
+        if text.strip() not in VALID_AUDIO_CODECS:
+            await invalid("Choose one of: " + ", ".join(sorted(VALID_AUDIO_CODECS)))
+            return
+        settings.setdefault("audio", {})["codec"] = text.strip()
+
+    elif data == "edit_audio_track":
+        val = text.strip().lower()
+        if val not in ("all", "none") and not val.isdigit():
+            await invalid("Use: all / none / a track number like 1.")
+            return
+        settings.setdefault("audio", {})["track"] = val
+
+    elif data == "edit_video_sample":
+        val = text.strip()
+        if val == "0":
+            settings.setdefault("video", {})["sample_seconds"] = 0
+        elif val.isdigit() and 10 <= int(val) <= 600:
+            settings.setdefault("video", {})["sample_seconds"] = int(val)
+        else:
+            await invalid("Enter 0 (off) or a number of seconds between 10 and 600.")
+            return
+
+    elif data == "edit_trim":
+        val = text.strip().lower()
+        if val == "off":
+            settings.setdefault("video", {}).update({"trim_start": 0, "trim_end": 0})
+        else:
+            parts = val.split()
+            if len(parts) != 2:
+                await invalid("Send two numbers: start end.")
+                return
+            try:
+                t_start, t_end = float(parts[0]), float(parts[1])
+            except ValueError:
+                await invalid("Numbers only, e.g. 10 120.")
+                return
+            if t_end <= t_start or t_start < 0:
+                await invalid("End must be greater than start.")
+                return
+            settings.setdefault("video", {}).update(
+                {"trim_start": t_start, "trim_end": t_end}
+            )
+
+    elif data == "edit_rename":
+        val = text.strip()
+        if val.lower() == "off" or not val:
+            settings["rename"] = {"pattern": ""}
+        elif len(val) > 60:
+            await invalid("Pattern too long (max 60 chars).")
+            return
+        else:
+            # Reject patterns that would explode at format time.
+            try:
+                val.format(original="", res="", codec="", date="")
+            except (KeyError, IndexError, ValueError):
+                await invalid(
+                    "Unknown placeholder. Allowed: {original} {res} {codec} {date}"
+                )
+                return
+            settings["rename"] = {"pattern": val}
 
     elif data.startswith("edit_meta_val_"):
         category, key = data.split("_", 3)[-1].split("|")
 
-        if "metadata" not in settings: settings["metadata"] = {}
-        if category not in settings["metadata"]: settings["metadata"][category] = {}
+        if "metadata" not in settings:
+            settings["metadata"] = {}
+        if category not in settings["metadata"]:
+            settings["metadata"][category] = {}
 
         if text.lower() == "clear":
-            if key in settings["metadata"][category]:
-                del settings["metadata"][category][key]
-            await message.reply_text(f"🗑 Cleared {category} metadata <b>{key}</b>")
+            settings["metadata"][category].pop(key, None)
+            await message.reply_text(f"🗑 Cleared {category} metadata <b>{escape(key)}</b>")
         else:
             settings["metadata"][category][key] = text
-            await message.reply_text(f"✅ Set {category} metadata <b>{key}</b> to <code>{text}</code>")
-
+            await message.reply_text(
+                f"✅ Set {category} metadata <b>{escape(key)}</b> to <code>{escape(text)}</code>"
+            )
         await update_user_settings(user_id, settings)
-
-        # Return to category menu
         callback_query.data = f"set_meta_cat_{category}"
         await settings_callback(client, callback_query)
         return
 
-    # Return to main menu
+    saved = await update_user_settings(user_id, settings)
+    if saved:
+        await message.reply_text("✅ Setting updated!")
+    else:
+        await message.reply_text("⚠️ Could not save your setting — please try again.")
+
+    callback_query.data = "set_main"
     await settings_command(client, message, query=True)
 
 
@@ -600,18 +656,20 @@ async def toggle_res_callback(client, callback_query: CallbackQuery):
         current_res = [current_res]
 
     if res in current_res:
-        if len(current_res) > 1:  # Prevent removing the last one
+        if len(current_res) > 1:
             current_res.remove(res)
+        else:
+            await callback_query.answer("⚠️ At least one resolution must stay enabled.", show_alert=True)
+            return
     else:
         current_res.append(res)
 
     settings["video"]["resolution"] = current_res
     await update_user_settings(user_id, settings)
+    await callback_query.answer("✅ Toggled")
 
-    # Refresh menu
     callback_query.data = "edit_video_res"
     await edit_callback(client, callback_query)
-
 
 @Client.on_callback_query(filters.regex("^add_custom"))
 async def add_custom_callback(client, callback_query: CallbackQuery):
@@ -626,7 +684,7 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         name_msg = await client.listen(chat_id=user_id, timeout=60)
         name = name_msg.text
         await name_msg.delete()
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -636,15 +694,26 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         await settings_callback(client, callback_query)
         return
 
+    if not name:
+        await message.reply_text("❌ Please send a text name.")
+        return
+
+    safe_name = sanitize_custom_name(name)
+    if not safe_name:
+        await message.reply_text(
+            "❌ <b>Invalid name!</b>\nUse 1–32 characters: letters, numbers, <code>_</code>, <code>-</code> only."
+        )
+        return
+
     # 2. Ask for Command
-    text = f"<b>Enter the FFmpeg command for '{name}':</b>\n<i>Example: -c:v libx264 -crf 23</i>"
+    text = f"<b>Enter the FFmpeg command for '{escape(safe_name)}':</b>\n<i>Example: -c:v libx264 -crf 23</i>"
     await prompt_msg.edit_text(text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
 
     try:
         cmd_msg = await client.listen(chat_id=user_id, timeout=60)
         cmd = cmd_msg.text
         await cmd_msg.delete()
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -662,10 +731,13 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
     settings = await get_user_settings(user_id)
     if "custom_ffmpeg" not in settings:
         settings["custom_ffmpeg"] = {}
-    settings["custom_ffmpeg"][name] = cmd
-    await update_user_settings(user_id, settings)
+    settings["custom_ffmpeg"][safe_name] = cmd
+    saved = await update_user_settings(user_id, settings)
 
-    await message.reply_text(f"✅ Custom command <b>{name}</b> saved!")
+    if saved:
+        await message.reply_text(f"✅ Custom command <b>{safe_name}</b> saved!")
+    else:
+        await message.reply_text("⚠️ Could not save — please try again later.")
 
     # Return to custom menu
     callback_query.data = "set_custom"
@@ -687,7 +759,7 @@ async def del_custom_callback(client, callback_query: CallbackQuery):
     await settings_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^(set_watermark|wm_(toggle|select|set|preview))"))
+@Client.on_callback_query(filters.regex("^wm_(toggle|select|set|preview)"))
 async def watermark_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -724,7 +796,7 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             has_font = "✅ Custom" if os.path.exists(f"watermarks/fonts/{user_id}.ttf") else "🤖 Default"
             text += (
                 f"📝 <b>Text Settings:</b>\n"
-                f"<blockquote>• <b>Content:</b> <code>{wm['text']}</code>\n"
+                f"<blockquote>• <b>Content:</b> <code>{escape(str(wm['text']))}</code>\n"
                 f"• <b>Size:</b> {wm['font_size']}\n"
                 f"• <b>Border Opacity:</b> {wm['border_opacity']}\n"
                 f"• <b>Font:</b> {has_font}</blockquote>"
@@ -901,7 +973,7 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
         text = input_msg.text
         await input_msg.delete()
         log.info(f"WM Edit Input: {text}")
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -985,24 +1057,29 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
              await message.reply_text("❌ Not an image!")
              return
 
+        doc = input_msg.document or input_msg.photo
+        if getattr(doc, "file_size", 0) and doc.file_size > 5 * 1024 * 1024:
+            await message.reply_text("❌ Image too large (max 5 MB).")
+            return
+
         # Download
+        os.makedirs("watermarks", exist_ok=True)
         save_path = os.path.join(os.getcwd(), "watermarks", f"{user_id}.png")
         path = await input_msg.download(file_name=save_path)
         await input_msg.delete()
 
-        # Read binary data
-        with open(path, "rb") as f:
-            image_data = f.read()
-
         settings = await get_user_settings(user_id)
         if "watermark" not in settings: settings["watermark"] = {}
         settings["watermark"]["image_path"] = path
-        settings["watermark"]["image_data"] = image_data # Save to DB
-        await update_user_settings(user_id, settings)
+        settings["watermark"].pop("image_data", None)  # never store blobs in Mongo
+        saved = await update_user_settings(user_id, settings)
 
-        await message.reply_text("✅ Watermark Image Saved!")
+        if saved:
+            await message.reply_text("✅ Watermark Image Saved!")
+        else:
+            await message.reply_text("⚠️ Could not save — please try again later.")
 
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -1012,7 +1089,11 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
              await watermark_callback(client, callback_query)
              return
         log.error(f"WM Upload Error: {e}")
-        await prompt_msg.delete()
+        try:
+            await prompt_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text("❌ Failed to save the image. Please try again.")
         return
 
     # Return
@@ -1068,7 +1149,7 @@ async def wm_timing_callback(client, callback_query: CallbackQuery):
         await update_user_settings(user_id, settings)
         await message.reply_text("✅ Timing Updated!")
 
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -1100,6 +1181,10 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
              await message.reply_text("❌ Not a valid font file (TTF/OTF)!")
              return
 
+        if input_msg.document.file_size > 5 * 1024 * 1024:
+            await message.reply_text("❌ Font too large (max 5 MB).")
+            return
+
         # Ensure directory
         if not os.path.exists("watermarks/fonts"):
             os.makedirs("watermarks/fonts")
@@ -1108,18 +1193,17 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
         path = await input_msg.download(file_name=f"watermarks/fonts/{user_id}.ttf")
         await input_msg.delete()
 
-        # Read binary data
-        with open(path, "rb") as f:
-            font_data = f.read()
-
         settings = await get_user_settings(user_id)
         if "watermark" not in settings: settings["watermark"] = {}
-        settings["watermark"]["font_data"] = font_data # Save to DB
-        await update_user_settings(user_id, settings)
+        settings["watermark"].pop("font_data", None)  # never store blobs in Mongo
+        saved = await update_user_settings(user_id, settings)
 
-        await message.reply_text("✅ Custom Font Saved!")
+        if saved:
+            await message.reply_text("✅ Custom Font Saved!")
+        else:
+            await message.reply_text("⚠️ Could not save — please try again later.")
 
-    except asyncio.TimeoutError:
+    except ListenerTimeout:
         await prompt_msg.delete()
         await message.reply_text("❌ Timed out.")
         return
@@ -1129,7 +1213,11 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
              await watermark_callback(client, callback_query)
              return
         log.error(f"WM Font Upload Error: {e}")
-        await prompt_msg.delete()
+        try:
+            await prompt_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text("❌ Failed to save the font. Please try again.")
         return
 
     # Return
@@ -1173,7 +1261,8 @@ async def cancel_input_callback(client, callback_query: CallbackQuery):
     await callback_query.answer("Cancelled")
 
 
-@Client.on_callback_query(filters.regex(r"^set_thumbnail"))
+# Invoked via delegation from settings_callback (the ^set_ handler owns
+# dispatch for all set_thumbnail* callback data).
 async def thumbnail_callback(client, callback_query):
     user_id = callback_query.from_user.id
     settings = await get_user_settings(user_id)
@@ -1194,7 +1283,7 @@ async def thumbnail_callback(client, callback_query):
 
         buttons_list = [
             [InlineKeyboardButton("📤 Upload New", callback_data="set_thumbnail_upload")],
-            [InlineKeyboardButton("🔙 Back", callback_data="settings")]
+            [InlineKeyboardButton("🔙 Back", callback_data="set_main")]
         ]
 
         if thumb_exists:
@@ -1253,13 +1342,14 @@ async def thumbnail_callback(client, callback_query):
 
         # Listen for photo
         try:
-            input_msg = await client.listen(user_id, filters=filters.photo, timeout=300)
+            input_msg = await client.listen(chat_id=user_id, filters=filters.photo, timeout=300)
 
-            # Download photo
-            # We want the highest quality photo
             photo = input_msg.photo
+            if getattr(photo, "file_size", 0) and photo.file_size > 5 * 1024 * 1024:
+                await input_msg.reply_text("❌ Image too large (max 5 MB).")
+                return
 
-            # Download to memory
+            os.makedirs("thumbs", exist_ok=True)
             file_path = await client.download_media(input_msg, file_name=f"thumbs/{user_id}.jpg")
 
             if file_path and os.path.exists(file_path):
@@ -1281,7 +1371,7 @@ async def thumbnail_callback(client, callback_query):
             else:
                 await input_msg.reply_text("❌ Failed to download photo.")
 
-        except asyncio.TimeoutError:
+        except ListenerTimeout:
             await callback_query.message.edit("❌ Timeout. Please try again.")
         except Exception as e:
             if "ListenerCanceled" in str(e):
