@@ -22,7 +22,12 @@ from bot.config import (
 )
 from bot.func.download_manager import download_manager
 from bot.func.ffmpeg_utils import generate_ffmpeg_cmd
-from bot.func.pyroutils.progress import TimeFormatter, humanbytes, progress_for_pyrogram
+from bot.func.pyroutils.progress import (
+    TimeFormatter,
+    clear_cancel,
+    humanbytes,
+    progress_for_pyrogram,
+)
 from bot.func.queue_manager import queue_manager
 from bot.func.upload_manager import upload_manager
 from bot.logger import LOGGER
@@ -37,6 +42,10 @@ active_encodings = {}
 # Job-id -> short technical error detail (for the "Details" button). Capped.
 ERROR_DETAILS: Dict[str, str] = {}
 ERROR_DETAILS_CAP = 50
+
+# error_key -> kwargs for retrying a failed upload (file kept on disk).
+UPLOAD_RETRY: Dict[str, Dict[str, Any]] = {}
+UPLOAD_RETRY_CAP = 20
 
 
 def _remember_error(key: str, detail: str):
@@ -788,12 +797,14 @@ async def safe_download_media(
 ):
     try:
         await download_manager.acquire()
+        clear_cancel(progress_msg.id)
         downloaded_path = await client.download_media(
             message,
             file_name=file_path,
             progress=progress_for_pyrogram,
             progress_args=("📥 Downloading...", progress_msg, time.time()),
         )
+        clear_cancel(progress_msg.id)
 
         if not downloaded_path or not os.path.exists(downloaded_path):
             log.error(f"Download reported success but file not found: {downloaded_path}")
@@ -801,9 +812,13 @@ async def safe_download_media(
 
         return downloaded_path
     except Exception as e:
-        log.error(f"Download failed: {e}")
+        if "Transfer cancelled" in str(e):
+            log.info("Download cancelled by user")
+        else:
+            log.error(f"Download failed: {e}")
         return None
     finally:
+        clear_cancel(progress_msg.id)
         download_manager.release()
 
 
@@ -1093,28 +1108,37 @@ async def _upload_video(
             caption=caption,
             thumb=thumb,
             file_name=file_name,
-            progress=progress_for_pyrogram,
-            progress_args=("📤 Uploading encoded video...", upload_msg, time.time()),
             reply_markup=_completion_buttons(bot_username),
         )
-
+        if upload_msg:
+            clear_cancel(upload_msg.id)
         sent_message = None
         for attempt in range(2):
             try:
                 if as_video:
                     try:
                         sent_message = await client.send_video(
-                            supports_streaming=True, video=file_path, **send_kwargs
+                            supports_streaming=True,
+                            video=file_path,
+                            progress=progress_for_pyrogram,
+                            progress_args=("📤 Uploading encoded video...", upload_msg, time.time()),
+                            **send_kwargs,
                         )
                     except Exception:
                         # Fall back to document if streamable send is rejected.
                         send_kwargs.pop("supports_streaming", None)
                         sent_message = await client.send_document(
-                            document=file_path, **send_kwargs
+                            document=file_path,
+                            progress=progress_for_pyrogram,
+                            progress_args=("📤 Uploading encoded video...", upload_msg, time.time()),
+                            **send_kwargs,
                         )
                 else:
                     sent_message = await client.send_document(
-                        document=file_path, **send_kwargs
+                        document=file_path,
+                        progress=progress_for_pyrogram,
+                        progress_args=("📤 Uploading encoded video...", upload_msg, time.time()),
+                        **send_kwargs,
                     )
                 break
             except FloodWait as e:
@@ -1123,6 +1147,8 @@ async def _upload_video(
                     await asyncio.sleep(e.value)
                 else:
                     raise
+        if upload_msg:
+            clear_cancel(upload_msg.id)
 
         output_deleted = True
 
@@ -1152,9 +1178,36 @@ async def _upload_video(
             log.error(f"Failed to update stats: {stats_error}")
 
     except Exception as e:
+        if upload_msg:
+            clear_cancel(upload_msg.id)
+        if "Transfer cancelled" in str(e):
+            log.info("Upload cancelled by user")
+            try:
+                await upload_msg.edit("❌ <b>Upload cancelled.</b>")
+            except Exception:
+                pass
+            output_deleted = True
+            return
         log.error(f"Upload failed: {e}", exc_info=True)
         error_key = job_id or f"upload_{int(time.time())}"
         _remember_error(error_key, str(e))
+        if len(UPLOAD_RETRY) >= UPLOAD_RETRY_CAP:
+            UPLOAD_RETRY.pop(next(iter(UPLOAD_RETRY)))
+        UPLOAD_RETRY[error_key] = {
+            "client": client,
+            "user_id": user_id,
+            "file_path": file_path,
+            "progress_msg": progress_msg,
+            "stats": stats,
+            "original_size": original_size,
+            "codec": codec,
+            "crf": crf,
+            "preset": preset,
+            "resolution": resolution,
+            # Auto-generated thumb is cleaned up in finally; regenerate on retry.
+            "thumb": None if auto_thumb_path else thumb,
+            "job_id": job_id,
+        }
         if upload_msg:
             try:
                 await upload_msg.edit(
@@ -1165,7 +1218,11 @@ async def _upload_video(
                                 InlineKeyboardButton(
                                     "🔍 Details",
                                     callback_data=f"cb_err_{error_key}",
-                                )
+                                ),
+                                InlineKeyboardButton(
+                                    "🔁 Retry",
+                                    callback_data=f"cb_retry_upload_{error_key}",
+                                ),
                             ]
                         ]
                     ),
@@ -1204,11 +1261,26 @@ async def encode(
 
     output_base = str(Path(input_file).parent / os.path.splitext(custom_output_name)[0])
 
+    # Pre-assign the job id so the queued card and worker share one id.
+    job_id = str(uuid.uuid4())[:8]
+
     if message:
         try:
             await message.delete()
         except Exception:
             pass
+
+    try:
+        me = await client.get_me()
+        queue_url = f"https://t.me/{me.username}?start=queue"
+    except Exception:
+        queue_url = None
+
+    markup = None
+    if queue_url:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 Open queue", url=queue_url)]]
+        )
 
     message = await client.send_message(
         user_id,
@@ -1216,13 +1288,8 @@ async def encode(
         f"<blockquote>🆔 <code>{job_id}</code>\n"
         f"Waiting for a free worker slot…</blockquote>\n"
         f"<i>Track progress in /queue</i>",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📋 Open queue", url=f"https://t.me/{(await client.get_me()).username}?start=queue")]]
-        ),
+        reply_markup=markup,
     )
-
-    # Pre-assign the job id so the worker never runs with placeholder args.
-    job_id = str(uuid.uuid4())[:8]
 
     async def worker(jid_arg):
         settings = await get_user_settings(user_id)

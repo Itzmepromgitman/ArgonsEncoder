@@ -39,3 +39,7 @@ RUN pip3 install --user --no-cache-dir -r requirements.txt
 
 # 5. Start bot (single supervised foreground process; health endpoint on $PORT)
 CMD ["bash", "start.sh"]
+
+# Health check against the aiohttp keep-alive endpoint.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8030')+'/', timeout=3)" || exit 1

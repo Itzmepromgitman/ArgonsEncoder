@@ -88,20 +88,21 @@ def prepare_watermark_assets(user_id: int, settings: Dict):
 
 
 def prepare_thumbnail(user_id: int, settings: Dict) -> Optional[str]:
-    """Restores the user's custom thumbnail to disk. Returns path or None."""
+    """Returns the user's thumbnail path (file already on disk) or None."""
     thumb = settings.get("thumbnail")
-    if not thumb or not isinstance(thumb, bytes):
+    if not thumb:
         return None
+    if isinstance(thumb, str):
+        return thumb if os.path.exists(thumb) else None
+    if isinstance(thumb, bytes):
+        from bot.config import THUMB_DIR
 
-    from bot.config import THUMB_DIR
-
-    thumb_path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
-
-    if not os.path.exists(thumb_path):
-        if not _write_asset(thumb_path, thumb):
-            return None
-
-    return thumb_path
+        thumb_path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
+        if not os.path.exists(thumb_path):
+            if not _write_asset(thumb_path, thumb):
+                return None
+        return thumb_path
+    return None
 
 
 def escape_drawtext(text: str) -> str:
@@ -386,6 +387,17 @@ def generate_ffmpeg_cmd(
             cmd.extend(["-to", str(trim_end)])
 
         cmd.extend(["-threads", str(FFMPEG_THREADS)])
+
+        # Active custom FFmpeg args (user-selected override), appended before output.
+        active_custom = settings.get("active_custom_ffmpeg")
+        if active_custom and not remux:
+            custom_map = settings.get("custom_ffmpeg", {}) or {}
+            custom_args = custom_map.get(active_custom, "")
+            if custom_args:
+                try:
+                    cmd.extend(shlex.split(custom_args))
+                except ValueError:
+                    log.warning(f"Invalid custom_ffmpeg args for {active_custom!r}")
 
         # Output path is appended by FFmpegProcess.start() along with -y.
         # Streamable delivery prefers MP4 + faststart for instant playback.

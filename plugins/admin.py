@@ -5,8 +5,6 @@ from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
 try:
@@ -19,7 +17,7 @@ from bot.decorator import invalidate_user_caches, is_admin
 from bot.logger import LOGGER, send_logs
 from bot.utils.restart import restart_bot
 from bot.utils.shell import shell_command
-from bot.utils.ui import ICONS, btn, close_btn, safe_edit
+from bot.utils.ui import ICONS, close_btn, safe_edit
 from database import full_userbase, del_user, get_variable, set_variable
 
 log = LOGGER(__name__)
@@ -330,10 +328,7 @@ async def admin2(client, query):
     while True:
         b = await client.send_message(
             uid,
-            text=txt,
-            reply_markup=ReplyKeyboardMarkup(
-                [["❌ Cancel"]], one_time_keyboard=True, resize_keyboard=True
-            ),
+            text=txt + "\n<i>Send a user ID, username, or forward a message. Send /cancel to abort.</i>",
         )
         try:
             a = await client.listen(chat_id=uid, timeout=30)
@@ -341,16 +336,14 @@ async def admin2(client, query):
             await client.send_message(
                 chat_id=uid,
                 text="⏰ Timed out — admin setup cancelled.",
-                reply_markup=ReplyKeyboardRemove(),
             )
             await b.delete()
             break
 
-        if a.text and a.text.lower() == "❌ cancel":
+        if a.text and a.text.lower().strip() in ("/cancel", "cancel", "❌ cancel"):
             await client.send_message(
                 chat_id=uid,
                 text="🚫 Admin setup cancelled.",
-                reply_markup=ReplyKeyboardRemove(),
             )
             await b.delete()
             break
@@ -384,7 +377,6 @@ async def admin2(client, query):
         await client.send_message(
             uid,
             f"✅ User <code>{chat_id}</code> {verb} the admin list.",
-            reply_markup=ReplyKeyboardRemove(),
         )
 
         # Drop the old panel (if any) and send a fresh one.

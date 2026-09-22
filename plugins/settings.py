@@ -91,9 +91,9 @@ async def render_settings_menu(client, message, query: bool = False, user_id: in
 
     settings = await get_user_settings(user_id)
 
-    # Merge with defaults if missing
+    # Merge with defaults if missing (deepcopy — never share the module dict)
     if not settings:
-        settings = DEFAULT_SETTINGS
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
         await update_user_settings(user_id, settings)
 
     # Ensure resolution is a list (migration)
@@ -315,6 +315,28 @@ async def settings_callback(client, callback_query: CallbackQuery):
         cmds_buttons.append(
             [InlineKeyboardButton("➕ Add New Command", callback_data="add_custom")]
         )
+        # Active override toggle (wired into generate_ffmpeg_cmd).
+        active = settings.get("active_custom_ffmpeg")
+        if custom_cmds:
+            if active and active in custom_cmds:
+                cmds_buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"🟢 Active: {active}",
+                            callback_data="toggle_active_custom",
+                        )
+                    ]
+                )
+            else:
+                first = next(iter(custom_cmds))
+                cmds_buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"🔴 Activate {first}",
+                            callback_data=f"use_custom_{first}",
+                        )
+                    ]
+                )
         cmds_buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_main")])
 
         await message.edit_text(
@@ -495,12 +517,17 @@ async def edit_callback(client, callback_query: CallbackQuery):
         text = input_msg.text
         await input_msg.delete()
     except ListenerTimeout:
-        if prompt_msg:
-            try:
-                await prompt_msg.delete()
-            except Exception:
-                pass
-        await message.reply_text("❌ Timed out.")
+        # Restore the settings menu instead of deleting the prompt.
+        await callback_query.answer("⏰ Timed out.", show_alert=False)
+        try:
+            callback_query.data = "set_main"
+            await settings_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception:
         if prompt_msg:
@@ -681,11 +708,17 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         name = name_msg.text
         await name_msg.delete()
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
+        # Keep the menu; just toast the timeout.
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_custom"
+            await settings_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception:
         # Cancelled
@@ -713,11 +746,16 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         cmd = cmd_msg.text
         await cmd_msg.delete()
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_custom"
+            await settings_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception:
         # Cancelled
@@ -756,9 +794,36 @@ async def del_custom_callback(client, callback_query: CallbackQuery):
     settings = await get_user_settings(user_id)
     if "custom_ffmpeg" in settings and name in settings["custom_ffmpeg"]:
         del settings["custom_ffmpeg"][name]
+        if settings.get("active_custom_ffmpeg") == name:
+            settings["active_custom_ffmpeg"] = ""
+            settings["active_custom_ffmpeg"] = ""
         await update_user_settings(user_id, settings)
 
     # Refresh custom menu
+    callback_query.data = "set_custom"
+    await settings_callback(client, callback_query)
+
+
+@Client.on_callback_query(filters.regex(r"^(toggle_active_custom|use_custom_)"))
+async def active_custom_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    settings = await get_user_settings(user_id)
+    custom = settings.get("custom_ffmpeg", {}) or {}
+
+    if data == "toggle_active_custom":
+        settings["active_custom_ffmpeg"] = ""
+        await callback_query.answer("🔴 Custom FFmpeg override off")
+    else:
+        name = data.replace("use_custom_", "")
+        if name in custom:
+            settings["active_custom_ffmpeg"] = name
+            await callback_query.answer(f"🟢 Using custom: {name}")
+        else:
+            await callback_query.answer("❌ Not found.", show_alert=True)
+            return
+
+    await update_user_settings(user_id, settings)
     callback_query.data = "set_custom"
     await settings_callback(client, callback_query)
 
@@ -978,11 +1043,16 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
         await input_msg.delete()
         log.info(f"WM Edit Input: {text}")
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception:
         # Cancelled or other error
@@ -1087,11 +1157,16 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
             await callback_query.answer("⚠️ Could not save — try again.", show_alert=True)
 
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception as e:
         if "ListenerCanceled" in str(e) or isinstance(e, asyncio.CancelledError):
@@ -1160,11 +1235,16 @@ async def wm_timing_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("✅ Timing updated", show_alert=False)
 
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception:
         # Cancelled
@@ -1183,6 +1263,12 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
     message = callback_query.message
     log.info(f"WM Font Upload Callback for user {user_id}")
 
+    text = (
+        "<b>🔤 Send your font file</b>\n"
+        "<blockquote>TTF or OTF · max 5 MB</blockquote>\n"
+        "<i>Press Cancel to abort.</i>"
+    )
+    await callback_query.answer()
     prompt_msg = await message.edit_text(
         text=text,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
@@ -1217,11 +1303,16 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
             await callback_query.answer("⚠️ Could not save — try again.", show_alert=True)
 
     except ListenerTimeout:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
         await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        try:
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+        except Exception:
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except Exception:
+                    pass
         return
     except Exception as e:
         if "ListenerCanceled" in str(e) or isinstance(e, asyncio.CancelledError):
@@ -1354,15 +1445,11 @@ async def thumbnail_callback(client, callback_query):
             file_path = await client.download_media(input_msg, file_name=f"thumbs/{user_id}.jpg")
 
             if file_path and os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    thumb_data = f.read()
-
-                # Save to settings
-                settings["thumbnail"] = thumb_data
+                # Keep the file on disk under THUMB_DIR; store only the path
+                # (never raw image bytes in Mongo).
+                settings["thumbnail"] = file_path
+                settings.pop("thumbnail_data", None)
                 await update_user_settings(user_id, settings)
-
-                # Cleanup
-                os.remove(file_path)
 
                 await input_msg.reply_text("<b>✅ Thumbnail saved!</b>")
                 await callback_query.answer()
@@ -1375,9 +1462,13 @@ async def thumbnail_callback(client, callback_query):
 
         except ListenerTimeout:
             try:
-                await callback_query.message.edit("⏰ Timeout — open <code>/settings</code> to try again.")
+                callback_query.data = "set_thumbnail"
+                await thumbnail_callback(client, callback_query)
             except Exception:
-                pass
+                try:
+                    await callback_query.message.edit("⏰ Timeout — open <code>/settings</code> to try again.")
+                except Exception:
+                    pass
         except Exception as e:
             if "ListenerCanceled" in str(e):
                  await safe_edit(callback_query.message, "🚫 Cancelled.")

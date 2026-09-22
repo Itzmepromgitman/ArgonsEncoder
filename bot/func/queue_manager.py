@@ -416,8 +416,12 @@ class QueueManager:
         return self._jobs.get(job_id)
 
     def queue_position(self, job_id: str) -> int:
-        """1-based position of the job among all active/pending jobs."""
-        ordered = list(self._jobs.values())
+        """1-based position among active jobs only (FIFO-safe)."""
+        ordered = [
+            job
+            for job in self._jobs.values()
+            if job.status in ("pending", "running", "yielded")
+        ]
         for i, job in enumerate(ordered, 1):
             if job.job_id == job_id:
                 return i

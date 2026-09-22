@@ -23,8 +23,8 @@ jobs:
       - name: Syntax check (compileall)
         run: python -m compileall -q bot plugins database.py update.py verify_ffmpeg_cmd.py
 
-      - name: Ruff (errors only)
-        run: ruff check . --select E9,F63,F7,F82,F401 --ignore F401 --exit-zero
+      - name: Ruff (undefined names + real errors)
+        run: ruff check . --select E9,F63,F7,F81,F82,F821,F822,F823,F401
 
       - name: Unit tests
         run: |

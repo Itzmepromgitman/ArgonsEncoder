@@ -49,7 +49,7 @@
 
 ### 🛠️ **Robust Management**
 - **Maintenance Mode**: Reject new jobs while finishing current ones (`/maint`).
-- **Ban / Unban**: Enforced at intake and on every command (`/ban`, `/unban`).
+- **Ban / Unban**: Enforced at intake and on core user commands (`/ban`, `/unban`).
 - **Owner /jobs**: Fleet-wide dashboard with one-tap cancel.
 - **Startup Cleanup**: Transient dirs wiped on boot; logs rotated under `logs/`.
 - **Health Endpoint**: aiohttp keep-alive server bound to `$PORT`.

@@ -1,13 +1,15 @@
 # Developed by ARGON telegram: @REACTIVEARGON
+import asyncio
+import os
 import time
 
 from pyrogram import Client, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup
 
 from bot.config import BOT_NAME
 from bot.decorator import task
 from bot.logger import LOGGER
-from bot.utils.ui import ICONS, back_btn, btn, close_btn, safe_edit, truncate
+from bot.utils.ui import ICONS, back_btn, btn, close_btn, safe_edit
 from database import full_userbase, add_user, get_stats
 
 log = LOGGER(__name__)
@@ -122,7 +124,10 @@ def _main_menu_buttons() -> InlineKeyboardMarkup:
                 btn(f"{ICONS.stats} Stats", "cb_stats"),
                 btn(f"{ICONS.about} About", "cb_about"),
             ],
-            [close_btn()],
+            [
+                btn(f"{ICONS.back} Home", "cb_start"),
+                close_btn(),
+            ],
         ]
     )
 
@@ -317,8 +322,18 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
                                 InlineKeyboardMarkup([[btn(f"{ICONS.home} Home", "cb_start")]]))
             return
 
+        elif data == "cb_xfer_cancel":
+            from bot.func.pyroutils.progress import flag_cancel
+
+            flag_cancel(message.id)
+            await callback_query.answer("❌ Cancelling transfer…")
+            return
+
         elif data == "cb_queue_hint":
-            await callback_query.answer("Send /queue to open your job list.", show_alert=True)
+            # Open the real queue view instead of a toast.
+            from plugins.queue import queue_command
+
+            await queue_command(client, message)
             return
 
         elif data.startswith("cb_err_"):
@@ -328,6 +343,25 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             detail = ERROR_DETAILS.get(job_id, "No details available.")
             # Telegram callback answers are capped at 200 chars.
             await callback_query.answer(detail[:190], show_alert=True)
+            return
+
+        elif data.startswith("cb_retry_upload_"):
+            from bot.func.encode import UPLOAD_RETRY, _upload_video
+
+            error_key = data.replace("cb_retry_upload_", "", 1)
+            ctx = UPLOAD_RETRY.pop(error_key, None)
+            if not ctx or not os.path.isfile(ctx.get("file_path", "")):
+                await callback_query.answer(
+                    "⚠️ Retry unavailable — file or context expired.",
+                    show_alert=True,
+                )
+                return
+            await callback_query.answer("🔁 Retrying upload…")
+            try:
+                await message.edit("📤 <b>Retrying upload…</b>\n<i>Sending your encoded file.</i>")
+            except Exception:
+                pass
+            asyncio.create_task(_upload_video(**ctx))
             return
 
         else:

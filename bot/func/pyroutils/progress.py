@@ -12,11 +12,27 @@ log = LOGGER(__name__)
 
 # Global state for rate limiting
 _progress_state = {}
+# Cancel flags keyed by progress message id; progress callback raises to abort.
+_cancel_flags = {}
+
+
+def flag_cancel(message_id: int) -> None:
+    _cancel_flags[message_id] = True
+
+
+def clear_cancel(message_id: int) -> None:
+    _cancel_flags.pop(message_id, None)
+
+
+def is_cancelled(message_id: int) -> bool:
+    return _cancel_flags.get(message_id, False)
 
 
 async def progress_for_pyrogram(
     current, total, ud_type, message, start, last_update_time=None
 ):
+    if _cancel_flags.get(message.id):
+        raise RuntimeError("Transfer cancelled by user")
     # Use global state for rate limiting
     unique_id = f"{message.chat.id}_{message.id}"
     last_time = _progress_state.get(unique_id, 0)
@@ -64,7 +80,7 @@ async def progress_for_pyrogram(
             await message.edit(
                 text=progress_text,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("❌ Cancel", callback_data="cb_close")]]
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="cb_xfer_cancel")]]
                 ),
             )
             if current == total:

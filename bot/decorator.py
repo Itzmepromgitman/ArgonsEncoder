@@ -82,6 +82,16 @@ def task(func):
 
             client = args[0] if args else None
             if isinstance(client, Client):
+                # Prefer user-facing feedback on the triggering message.
+                msg = args[1] if len(args) >= 2 and hasattr(args[1], "reply_text") else None
+                if msg is not None:
+                    try:
+                        await msg.reply_text(
+                            "❌ <b>Something went wrong.</b>\n"
+                            "<i>The error was logged — please try again.</i>"
+                        )
+                    except Exception:
+                        pass
                 try:
                     await client.send_message(
                         chat_id=LOG_CHANNEL,

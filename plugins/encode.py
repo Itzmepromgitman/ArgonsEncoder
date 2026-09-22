@@ -67,7 +67,7 @@ async def check_and_process_video_document(message: Message) -> dict:
 
 
 @Client.on_message(
-    (filters.private) & (filters.document | filters.video | filters.audio)
+    (filters.private) & (filters.document | filters.video)
 )
 async def enhanced_document_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -119,22 +119,36 @@ async def enhanced_document_handler(client: Client, message: Message):
 
         fi = video_info["file_info"]
         if not video_info["is_encodable"]:
-            await message.reply_text(
-                f"⚠️ <b>Can't encode this file</b>\n"
-                f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
-                f"📦 {(fi['file_size'] or 0) / (1024 * 1024):.2f} MB · "
-                f"🏷️ {escape(fi['mime_type']) or 'unknown type'}</blockquote>\n"
-                f"<i>Unsupported format, or over the "
-                f"{MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>\n"
-                f"<i>Supported: MP4, MKV, AVI, MOV, WebM and similar.</i>"
-            )
+            size_mb = (fi["file_size"] or 0) / (1024 * 1024)
+            limit_gb = MAX_FILE_SIZE // (1024 * 1024 * 1024)
+            if fi["file_size"] and fi["file_size"] > MAX_FILE_SIZE:
+                await message.reply_text(
+                    f"⚠️ <b>File too large</b>\n"
+                    f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
+                    f"📦 {size_mb:.2f} MB · limit {limit_gb} GB</blockquote>\n"
+                    f"<i>Split the file or lower the resolution source, then retry.</i>"
+                )
+            else:
+                await message.reply_text(
+                    f"⚠️ <b>Can't encode this file</b>\n"
+                    f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
+                    f"📦 {size_mb:.2f} MB · "
+                    f"🏷️ {escape(fi['mime_type']) or 'unknown type'}</blockquote>\n"
+                    f"<i>Unsupported format. Supported: MP4, MKV, AVI, MOV, WebM and similar.</i>"
+                )
             return
 
         if not video_info["encoding_ready"]:
-            await message.reply_text(
-                "❌ <b>File looks corrupted</b>\n"
-                "<i>Try re-uploading it. If it keeps failing, the source file may be broken.</i>"
-            )
+            if fi["file_size"] and fi["file_size"] > MAX_FILE_SIZE:
+                await message.reply_text(
+                    f"⚠️ <b>File too large</b>\n"
+                    f"<i>Over the {MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>"
+                )
+            else:
+                await message.reply_text(
+                    "❌ <b>File looks corrupted</b>\n"
+                    "<i>Try re-uploading it. If it keeps failing, the source file may be broken.</i>"
+                )
             return
 
         downloads_dir = Path(DOWNLOAD_DIR)

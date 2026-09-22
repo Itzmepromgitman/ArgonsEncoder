@@ -11,6 +11,7 @@ from pyrogram.types import (
 )
 
 from bot.config import OWNER_ID
+from bot.decorator import task
 from bot.func.editquery import render_queue_text
 from bot.func.encode import active_encodings
 from bot.func.queue_manager import queue_manager
@@ -46,6 +47,7 @@ def _queue_keyboard(jobs, refresh_cb: str = "queue_view") -> InlineKeyboardMarku
 
 
 @Client.on_message(filters.command("cancel"))
+@task
 async def cancel_command(client: Client, message: Message):
     try:
         args = message.command
@@ -96,6 +98,7 @@ def _user_queue_view(user_id: int):
 
 
 @Client.on_message(filters.command("queue"))
+@task
 async def queue_command(client: Client, message: Message):
     user_id = message.from_user.id
     jobs, text = _user_queue_view(user_id)
@@ -135,6 +138,7 @@ async def queue_cancel_single(client: Client, callback_query: CallbackQuery):
 
 
 @Client.on_message(filters.command("status"))
+@task
 async def status_command(client: Client, message: Message):
     text, buttons = _status_card()
     await message.reply_text(text, reply_markup=buttons)
@@ -145,6 +149,8 @@ def _status_card():
     running = [j for j in jobs if j.status in ("running", "yielded")]
     pending = len(jobs) - len(running)
 
+    # Prime CPU so the first reading is not 0%.
+    psutil.cpu_percent(interval=None)
     cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage(".").percent
@@ -331,6 +337,7 @@ def escape_filename(name: str) -> str:
 
 
 @Client.on_message(filters.command("clear"))
+@task
 async def clear_command(client: Client, message: Message):
     user_id = message.from_user.id
 
@@ -355,9 +362,21 @@ async def clear_command(client: Client, message: Message):
             reply_markup=buttons,
         )
     else:
-        count = await _cancel_user_jobs(user_id)
+        count = len(queue_manager.get_user_jobs(user_id))
         if count:
-            await message.reply_text(f"✅ Cleared {count} of your jobs.")
+            await message.reply_text(
+                f"⚠️ <b>Clear {count} queued job(s)?</b>\n<i>This cannot be undone.</i>",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ Yes, clear", callback_data="queue_clear_mine"
+                            ),
+                            InlineKeyboardButton("❌ No", callback_data="cb_close"),
+                        ]
+                    ]
+                ),
+            )
         else:
             await message.reply_text(
                 empty_state("Nothing to clear", "You have no queued jobs.")
@@ -387,8 +406,14 @@ async def queue_callback_handler(client: Client, callback_query: CallbackQuery):
     action = callback_query.data
     user_id = callback_query.from_user.id
 
-    # Auth BEFORE touching the message.
-    if user_id != OWNER_ID:
+    # Auth: clear_mine is allowed for the requesting user; confirm_all is owner-only.
+    if action in ("queue_clear_mine",) and user_id != callback_query.message.chat.id:
+        # Non-owner may only clear their own jobs via their own confirmation.
+        pass
+    if action == "queue_confirm_all" and user_id != OWNER_ID:
+        await callback_query.answer("❌ Owner only.", show_alert=True)
+        return
+    if action not in ("queue_clear_mine", "queue_confirm_all", "queue_cancel") and user_id != OWNER_ID:
         await callback_query.answer("❌ Owner only.", show_alert=True)
         return
 
