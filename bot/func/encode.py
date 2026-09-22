@@ -256,17 +256,15 @@ class FFmpegProcess:
         except OSError:
             pass
 
-        estimated = "0 B"
         comp_text = ""
-        if self.stats.percent > 0:
+        if self.stats.percent > 0 and current_size > 0:
             est_size = current_size / (self.stats.percent / 100)
-            estimated = humanbytes(est_size)
             if est_size > 0 and self.original_size > 0:
                 comp = self.original_size / est_size
                 if comp >= 1:
-                    comp_text = f" · 🗜 {comp:.1f}x smaller"
+                    comp_text = f" · 🗜 {comp:.1f}× smaller"
                 else:
-                    comp_text = f" · 🗜 {1 / comp:.1f}x larger"
+                    comp_text = f" · 🗜 {1 / comp:.1f}× larger"
 
         step_info = f" · Step {self.current_step}/{self.total_steps}" if self.total_steps > 1 else ""
 
@@ -279,14 +277,12 @@ class FFmpegProcess:
             f"{status_icon} <b>{status_text}</b>{step_info}\n"
             f"📁 <code>{escape(self.file_name)}</code>\n"
             f"<blockquote><code>{bar}</code> <b>{self.stats.percent:.1f}%</b>\n"
-            f"📦 {current_size and humanbytes(current_size) or '0 B'} / {humanbytes(self.original_size)}"
-            f"{comp_text}\n"
+            f"📦 {humanbytes(current_size)} / {humanbytes(self.original_size)}{comp_text}\n"
             f"⏳ ETA <b>{self.stats.eta}</b> · ⏱ {self.stats.elapsed}\n"
             f"⚡ {self.stats.speed} · 🎞 {self.stats.fps:.1f} fps · 📊 {self.stats.bitrate}</blockquote>\n"
             f"<blockquote>⚙️ <code>{escape(str(self.codec))}</code> · CRF <code>{escape(str(self.crf))}</code> · "
             f"{escape(str(self.preset))} · {escape(str(self.resolution))}\n"
-            f"🆔 <code>{self.job_id}</code></blockquote>\n"
-            f"<i>Updates every {int(UI_UPDATE_INTERVAL)}s</i>"
+            f"🆔 <code>{self.job_id}</code></blockquote>"
         )
 
 
@@ -522,32 +518,36 @@ async def _handle_job_completion(
         active_encodings.pop(process.job_id, None)
         return "FINISHED"
 
-    # FAILED
-    stderr_text = process.stderr_tail.decode(errors="replace") if process.stderr_tail else "Unknown error"
-    log.error(f"FFmpeg failed for job {process.job_id}: {stderr_text[:800]}")
-    _remember_error(process.job_id, f"exit={process.process.returncode}\n{stderr_text}")
-    try:
-        await process.message.edit(
-            f"❌ <b>Encoding failed</b>\n"
-            f"<blockquote>📁 <code>{escape(process.file_name)}</code> · "
-            f"Step {process.current_step}/{process.total_steps}</blockquote>\n"
-            f"<i>Nothing was lost — send the file again to retry.</i>",
-            reply_markup=InlineKeyboardMarkup(
-                [
+    if status == "FAILED":
+        stderr_text = process.stderr_tail.decode(errors="replace") if process.stderr_tail else "Unknown error"
+        log.error(f"FFmpeg failed for job {process.job_id}: {stderr_text[:800]}")
+        _remember_error(process.job_id, f"exit={process.process.returncode}\n{stderr_text}")
+        try:
+            await process.message.edit(
+                f"❌ <b>Encoding failed</b>\n"
+                f"<blockquote>📁 <code>{escape(process.file_name)}</code> · "
+                f"Step {process.current_step}/{process.total_steps}</blockquote>\n"
+                f"<i>Nothing was lost — send the file again to retry, "
+                f"or open Details for the technical reason.</i>",
+                reply_markup=InlineKeyboardMarkup(
                     [
-                        InlineKeyboardButton(
-                            "🔍 Details", callback_data=f"cb_err_{process.job_id}"
-                        ),
-                        InlineKeyboardButton("🗑 Dismiss", callback_data="cb_close"),
+                        [
+                            InlineKeyboardButton(
+                                "🔍 Details", callback_data=f"cb_err_{process.job_id}"
+                            ),
+                            InlineKeyboardButton("⚙️ Settings", callback_data="cb_open_settings"),
+                        ],
+                        [
+                            InlineKeyboardButton("🗑 Dismiss", callback_data="cb_close"),
+                        ],
                     ]
-                ]
-            ),
-        )
-    except Exception as e:
-        log.error(f"Failed to edit failure message: {e}")
-    _cleanup_files(process, cleanup_input=cleanup_input)
-    active_encodings.pop(process.job_id, None)
-    return "FAILED"
+                ),
+            )
+        except Exception as e:
+            log.error(f"Failed to edit failure message: {e}")
+        _cleanup_files(process, cleanup_input=cleanup_input)
+        active_encodings.pop(process.job_id, None)
+        return "FAILED"
 
 
 def _cleanup_files(process: FFmpegProcess, cleanup_input: bool = True):
@@ -998,21 +998,44 @@ def render_caption(
     comp = 1.0
     if file_size > 0 and original_size > 0:
         comp = original_size / file_size
-    comp_line = f"🗜 Compression: <code>{comp:.2f}x</code>"
+    saved_pct = 0.0
+    if original_size > 0 and file_size < original_size:
+        saved_pct = (1 - file_size / original_size) * 100
 
-    sample_note = "\n⚠️ <i>SAMPLE encode — first seconds only</i>" if sample else ""
+    sample_note = "\n⚠️ <i>SAMPLE encode — first seconds only</i>\n" if sample else ""
 
     return (
-        f"🎬 <b>Encoding Completed</b>\n\n"
+        f"✅ <b>Encode completed</b>\n\n"
         f"<blockquote>📁 <code>{escape(file_name)}</code>\n"
         f"⚙️ {escape(str(codec))} · {escape(str(resolution))} · CRF {escape(str(crf))} · {escape(str(preset))}</blockquote>\n\n"
         f"<blockquote>📊 <b>Stats</b>\n"
         f"📥 Original: <code>{humanbytes(original_size)}</code>\n"
         f"📤 Encoded: <code>{humanbytes(file_size)}</code>\n"
-        f"⏱ Time: <code>{stats.elapsed}</code>\n"
-        f"{comp_line}</blockquote>\n"
-        f"{sample_note}\n"
-        f"🤖 Encoded by: @{bot_username}"
+        f"🗜 Compression: <code>{comp:.2f}×</code>"
+        + (f" · saved <code>{saved_pct:.1f}%</code>" if saved_pct > 0 else "")
+        + f"\n⏱ Time: <code>{stats.elapsed}</code></blockquote>\n"
+        f"{sample_note}"
+        f"🤖 Encoded by @{bot_username}"
+    )
+
+
+def _completion_buttons(bot_username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⚙️ Settings", callback_data="cb_open_settings"
+                ),
+                InlineKeyboardButton(
+                    "📋 Queue", url=f"https://t.me/{bot_username}?start=queue"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✨ Features", callback_data="cb_features"
+                ),
+            ],
+        ]
     )
 
 
@@ -1048,7 +1071,9 @@ async def _upload_video(
         if rename_pattern:
             renamed = apply_rename_pattern(rename_pattern, file_name, resolution, str(codec))
             if renamed:
-                file_name = renamed if renamed.endswith(".mkv") else f"{renamed}.mkv"
+                stem = Path(renamed).stem if renamed else Path(file_name).stem
+                ext = Path(file_name).suffix or (".mp4" if as_video else ".mkv")
+                file_name = f"{stem}{ext}"
 
         bot_username = (await client.get_me()).username
 
@@ -1057,7 +1082,7 @@ async def _upload_video(
             file_size, bot_username, sample=sample_mode,
         )
 
-        upload_msg = await client.send_message(user_id, "📤 <b>Starting Upload...</b>")
+        upload_msg = await client.send_message(user_id, "📤 <b>Uploading…</b>\n<i>Sending your encoded file.</i>")
 
         if not thumb:
             thumb = await generate_auto_thumbnail(file_path, user_id)
@@ -1070,6 +1095,7 @@ async def _upload_video(
             file_name=file_name,
             progress=progress_for_pyrogram,
             progress_args=("📤 Uploading encoded video...", upload_msg, time.time()),
+            reply_markup=_completion_buttons(bot_username),
         )
 
         sent_message = None
@@ -1184,7 +1210,16 @@ async def encode(
         except Exception:
             pass
 
-    message = await client.send_message(user_id, "⏳ <b>Adding to Queue...</b>")
+    message = await client.send_message(
+        user_id,
+        f"⏳ <b>Queued</b>\n"
+        f"<blockquote>🆔 <code>{job_id}</code>\n"
+        f"Waiting for a free worker slot…</blockquote>\n"
+        f"<i>Track progress in /queue</i>",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 Open queue", url=f"https://t.me/{(await client.get_me()).username}?start=queue")]]
+        ),
+    )
 
     # Pre-assign the job id so the worker never runs with placeholder args.
     job_id = str(uuid.uuid4())[:8]
@@ -1287,9 +1322,13 @@ async def encode(
         return {"success": False, "error": "Duplicate or limit reached"}
 
     await message.edit(
-        f"⏳ <b>Job Queued</b>\n"
-        f"🆔 Job ID: <code>{queued_id}</code>\n"
-        f"🔢 Position: {queue_manager.queue_position(queued_id)}"
+        f"⏳ <b>Job queued</b>\n"
+        f"<blockquote>🆔 Job ID: <code>{queued_id}</code>\n"
+        f"🔢 Position: <code>{queue_manager.queue_position(queued_id)}</code></blockquote>\n"
+        f"<i>Updates appear here when encoding starts.</i>",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 Open queue", callback_data="cb_queue_hint")]]
+        ),
     )
 
     return {"success": True, "job_id": queued_id, "output_file": output_base}

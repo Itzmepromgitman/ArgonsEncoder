@@ -45,7 +45,7 @@ LOG_DIR = os.environ.get("LOG_DIR", "logs")
 LOG_FILE_NAME = os.path.join(LOG_DIR, "bot.log")
 
 # --- Timing / UI ---
-UI_UPDATE_INTERVAL = float(os.environ.get("UI_UPDATE_INTERVAL", "5.0"))
+UI_UPDATE_INTERVAL = float(os.environ.get("UI_UPDATE_INTERVAL", "3.0"))
 PROGRESS_CALLBACK_INTERVAL = float(os.environ.get("PROGRESS_CALLBACK_INTERVAL", "3.0"))
 FFMPEG_THREADS = max(1, int(os.environ.get("FFMPEG_THREADS", str(os.cpu_count() or 1))))
 

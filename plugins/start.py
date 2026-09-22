@@ -7,6 +7,7 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from bot.config import BOT_NAME
 from bot.decorator import task
 from bot.logger import LOGGER
+from bot.utils.ui import ICONS, back_btn, btn, close_btn, safe_edit, truncate
 from database import full_userbase, add_user, get_stats
 
 log = LOGGER(__name__)
@@ -15,81 +16,120 @@ BOT_START_TIME = time.time()
 
 START_IMG = "https://i.ibb.co/RGJnsfC6/monkey-d-luffy-red-3840x2160-24473.png"
 
-START_TEXT = f"""🎬 <b>{BOT_NAME}</b>
+START_TEXT = f"""{ICONS.encode} <b>{BOT_NAME}</b>
 
-Hi! Send me any video and I'll encode it with your saved settings — automatically.
+Send me any video — I'll encode it with your saved settings automatically.
 
-<blockquote>⚡ FFmpeg-powered (x264 · x265 · VP9 · AV1)
-🧠 Smart queue with pause/resume &amp; auto-restore
+<blockquote>⚡ FFmpeg engine · x264 · x265 · VP9 · AV1
+🧠 Smart queue with pause / resume / auto-restore
 💧 Watermarks, thumbnails &amp; metadata support</blockquote>
 
+{ICONS.settings} Tweak quality any time with <code>/settings</code>
 Just upload a file to begin 👇
 """
 
-HELP_TEXT = """<blockquote><b>🛠️ Commands:</b>
+HELP_TEXT = f"""{ICONS.help} <b>How to use {BOT_NAME}</b>
 
-<code>/start</code> - Initialize
-<code>/settings</code> - Configure encoding
-<code>/queue</code> - View your jobs
-<code>/status</code> - Live server status
-<code>/cancel</code> - Abort a job (ID from /queue)
-<code>/clear</code> - Clear your jobs
-<code>/stats</code> - Bot statistics
-<code>/ss</code> - Screenshots (reply to video)
-<code>/help</code> - This manual</blockquote>
+<blockquote expandable><b>🎬 Encoding</b>
+Send or forward a video → it downloads → encodes → you get the file.
 
-<b>How it works:</b> send a video → it downloads → encodes with your settings → you get the file. That's it!
+<b>⚡ Quick commands</b>
+<code>/start</code> — Home
+<code>/settings</code> — Codec, CRF, audio, trim, watermark…
+<code>/queue</code> — Your jobs (tap 🚫 to cancel)
+<code>/status</code> — Live server load
+<code>/stats</code> — Global encode stats
+<code>/ss</code> — Screenshots (reply to a video)
+<code>/cancel &lt;id&gt;</code> — Cancel a job by ID
+<code>/clear</code> — Clear your queued jobs
+<code>/features</code> — Full feature list
+<code>/help</code> — This manual</blockquote>
+
+<b>Typical flow:</b> <code>/settings</code> → upload video → track in <code>/queue</code> → collect result.
 """
 
-ABOUT_TEXT = f"""
-<b>🤖 System Information</b>
+ABOUT_TEXT = f"""{ICONS.about} <b>About {BOT_NAME}</b>
 
-<b>Version:</b> <code>2.1.0 (Stable)</code>
-<b>Engine:</b> <code>Pyrogram + FFmpeg</code>
+<blockquote>Version: <code>2.2.0</code>
+Engine: <code>Pyrofork + FFmpeg</code>
+License: <code>GPL-3.0</code></blockquote>
 
-<blockquote>🔗 <b>Links:</b>
-• <a href="https://t.me/fair_bots">Main Channel</a>
+<blockquote expandable><b>🔗 Links</b>
+• <a href="https://t.me/fair_bots">Main channel</a>
 • <a href="https://t.me/reactiveargon">Developer</a>
-• <a href="https://t.me/fair_bot_support">Support Group</a></blockquote>
+• <a href="https://t.me/fair_bot_support">Support group</a></blockquote>
+
+<i>Made by @REACTIVEARGON</i>
 """
 
-TUTORIAL_TEXT = """
-<b>🚀 Quick Start Guide</b>
+TUTORIAL_TEXT = f"""{ICONS.tutorial} <b>Quick start</b>
 
-<blockquote><b>1. Send a Video</b>
-Simply forward or upload a video file to the bot.
+<blockquote expandable><b>1. Send a video</b>
+Forward or upload any video file to the bot.
 
-<b>2. Choose Settings</b>
-Use <code>/settings</code> to configure:
-• <b>Resolution:</b> 1080p, 720p, etc.
-• <b>Codec:</b> x264, x265 (HEVC)
-• <b>Watermark:</b> Add your custom branding
+<b>2. Tune settings</b>
+Open <code>/settings</code> to pick:
+• Resolution (1080p / 720p / 480p / 360p)
+• Codec &amp; quality (CRF, preset)
+• Audio, trim, watermark, thumbnail
 
 <b>3. Relax</b>
-The bot will process your video and send it back!</blockquote>
+Watch live progress, pause or cancel anytime,
+then collect the finished file.</blockquote>
 
-<i>Tip: Use /queue to check progress.</i>
+💡 Tip: <code>/queue</code> shows every active job.
 """
 
-FEATURES_TEXT = f"""<b>🚀 {BOT_NAME}</b>
+FEATURES_TEXT = f"""{ICONS.features} <b>{BOT_NAME} — Features</b>
 
-<blockquote>Professional-grade Telegram encoding! 🎬
+<blockquote expandable><b>🎥 Encoding</b>
+• Codecs: libx264, libx265, VP9, AV1, mpeg4
+• Never upscales — small sources keep their size
+• Audio codec / bitrate / track select or strip
+• Subtitles: copy or drop
+• Sample encodes, trim window, remux mode
+• Output rename patterns · video or document delivery
+• Auto thumbnails from real frames
 
-<b>Key Features:</b>
+<b>⚡ Queue</b>
+• Concurrent workers, per-user limits
+• Pause / resume / cancel from the progress card
+• Queue persists and auto-restores after restart
 
-• <b>Smart Queue:</b> Auto-resume &amp; persistence
-• <b>Pro Quality:</b> FFmpeg with custom presets
-• <b>Total Control:</b> Watermarks, metadata, trim &amp; sample encodes
+<b>🎨 UX</b>
+• Compact progress cards (bar, size, ETA, speed, FPS)
+• Friendly errors with a Details button
+• Unified queue view, live /status, real /stats
 
-<i>Fast, stable, and fully customizable.</i>
-
-Developed by @REACTIVEARGON</blockquote>
+<b>🛠 Admin</b>
+• Maintenance mode, ban/unban, broadcast
+• Owner dashboard, /shell, /restart, /log</blockquote>
 """
+
+
+def _main_menu_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                btn("🎬 Encode", "cb_encode_hint"),
+                btn("🚀 Guide", "cb_tutorial"),
+            ],
+            [
+                btn(f"{ICONS.settings} Settings", "cb_open_settings"),
+                btn(f"{ICONS.help} Help", "cb_help"),
+            ],
+            [
+                btn(f"{ICONS.stats} Stats", "cb_stats"),
+                btn(f"{ICONS.about} About", "cb_about"),
+            ],
+            [close_btn()],
+        ]
+    )
 
 
 @Client.on_message(filters.command("start"))
 @task
-async def start(client, message, query=False):
+async def start(client, message, query=False, payload: str = ""):
     if not query:
         from database import present_user
 
@@ -106,33 +146,39 @@ async def start(client, message, query=False):
 
                 await client.send_message(
                     LOG_CHANNEL,
-                    f"🆕 <b>New User Started Bot</b>\n\n"
+                    f"🆕 <b>New user started the bot</b>\n\n"
                     f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
                     f"🏷️ <b>Username:</b> {username}",
                 )
             except Exception as e:
                 log.error(f"Failed to send new user log: {e}")
 
-    buttons = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🎬 Encode", callback_data="cb_encode_hint"),
-                InlineKeyboardButton("🚀 Quick Start", callback_data="cb_tutorial"),
-                InlineKeyboardButton("📚 Help", callback_data="cb_help"),
-            ],
-            [
-                InlineKeyboardButton("⚙️ Settings", callback_data="cb_open_settings"),
-                InlineKeyboardButton("📊 Stats", callback_data="cb_stats"),
-                InlineKeyboardButton("ℹ️ About", callback_data="cb_about"),
-            ],
-            [
-                InlineKeyboardButton("❌ Close", callback_data="cb_close"),
-            ],
-        ]
-    )
+        # Deep-link payloads from inline buttons on finished encodes.
+        if not payload and message.command and len(message.command) > 1:
+            payload = str(message.command[1]).lower()
+
+        if payload in ("settings", "config"):
+            from plugins.settings import render_settings_menu
+
+            await render_settings_menu(
+                client, message, query=False, user_id=user_id
+            )
+            return
+        if payload == "queue":
+            from plugins.queue import queue_command
+
+            await queue_command(client, message)
+            return
+        if payload in ("help", "start"):
+            pass  # fall through to home menu
+
+    buttons = _main_menu_buttons()
 
     if query:
-        await message.edit_caption(caption=START_TEXT, reply_markup=buttons)
+        if message.photo:
+            await message.edit_caption(caption=START_TEXT, reply_markup=buttons)
+        else:
+            await safe_edit(message, START_TEXT, buttons)
     else:
         await message.reply_photo(
             photo=START_IMG, caption=START_TEXT, reply_markup=buttons
@@ -141,10 +187,15 @@ async def start(client, message, query=False):
 
 @Client.on_message(filters.command("help"))
 async def help_command(client, message):
-    buttons = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔙 Back", callback_data="cb_start")]]
+    await message.reply_text(
+        text=HELP_TEXT,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn(f"{ICONS.settings} Open Settings", "cb_open_settings")],
+                [back_btn()],
+            ]
+        ),
     )
-    await message.reply_text(text=HELP_TEXT, reply_markup=buttons)
 
 
 async def _stats_text() -> str:
@@ -162,7 +213,7 @@ async def _stats_text() -> str:
     uptime = time.time() - BOT_START_TIME
 
     return (
-        f"<b>📊 Bot Statistics</b>\n"
+        f"{ICONS.stats} <b>Bot statistics</b>\n"
         f"<blockquote>👥 Users: <code>{len(users):,}</code>\n"
         f"🎬 Total encodes: <code>{total_encodes:,}</code>\n"
         f"📥 Processed: <code>{humanbytes(in_bytes)}</code>\n"
@@ -175,87 +226,100 @@ async def _stats_text() -> str:
 @Client.on_message(filters.command("stats"))
 async def stats_command(client, message):
     stats_text = await _stats_text()
-    buttons = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Close", callback_data="cb_close")]]
+    await message.reply_text(
+        text=stats_text,
+        reply_markup=InlineKeyboardMarkup([[close_btn()]]),
     )
-    await message.reply_text(text=stats_text, reply_markup=buttons)
 
 
 @Client.on_message(filters.command("features"))
 async def features_command(client, message):
-    buttons = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Close", callback_data="cb_close")]]
+    await message.reply_text(
+        text=FEATURES_TEXT,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [btn(f"{ICONS.settings} Open Settings", "cb_open_settings")],
+                [back_btn()],
+            ]
+        ),
     )
-    await message.reply_text(text=FEATURES_TEXT, reply_markup=buttons)
+
+
+async def _edit_or_reply(message, text: str, buttons: InlineKeyboardMarkup):
+    """Show a panel on the current message when possible; otherwise reply."""
+    try:
+        if message.photo:
+            await message.edit_caption(caption=text, reply_markup=buttons)
+        else:
+            ok = await safe_edit(message, text, buttons)
+            if not ok:
+                await message.reply_text(text=text, reply_markup=buttons)
+    except Exception:
+        try:
+            await message.reply_text(text=text, reply_markup=buttons)
+        except Exception as e:
+            log.error(f"Panel render failed: {e}")
 
 
 @Client.on_callback_query(filters.regex("^cb_"))
 async def handle_callbacks(client, callback_query: CallbackQuery):
     data = callback_query.data
     message = callback_query.message
-    is_photo = bool(message.photo)
 
     try:
         if data == "cb_start":
-            if is_photo:
-                await start(client, message, query=True)
-            else:
-                await start(client, message, query=False)
+            await start(client, message, query=True)
 
         elif data == "cb_help":
-            buttons = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Back", callback_data="cb_start")]]
-            )
-            if is_photo:
-                await message.edit_caption(caption=HELP_TEXT, reply_markup=buttons)
-            else:
-                await message.edit_text(text=HELP_TEXT, reply_markup=buttons)
+            await _edit_or_reply(message, HELP_TEXT, InlineKeyboardMarkup(
+                [
+                    [btn(f"{ICONS.settings} Open Settings", "cb_open_settings")],
+                    [back_btn()],
+                ]
+            ))
 
         elif data == "cb_about":
-            buttons = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Back", callback_data="cb_start")]]
-            )
-            if is_photo:
-                await message.edit_caption(caption=ABOUT_TEXT, reply_markup=buttons)
-            else:
-                await message.edit_text(text=ABOUT_TEXT, reply_markup=buttons)
+            await _edit_or_reply(message, ABOUT_TEXT, InlineKeyboardMarkup([[back_btn()]]))
 
         elif data == "cb_tutorial":
-            buttons = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Back", callback_data="cb_start")]]
-            )
-            if is_photo:
-                await message.edit_caption(caption=TUTORIAL_TEXT, reply_markup=buttons)
-            else:
-                await message.edit_text(text=TUTORIAL_TEXT, reply_markup=buttons)
+            await _edit_or_reply(message, TUTORIAL_TEXT, InlineKeyboardMarkup([[back_btn()]]))
+
+        elif data == "cb_features":
+            await _edit_or_reply(message, FEATURES_TEXT, InlineKeyboardMarkup([[back_btn()]]))
 
         elif data == "cb_stats":
             stats_text = await _stats_text()
-            buttons = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Back", callback_data="cb_start")]]
-            )
-            if is_photo:
-                await message.edit_caption(caption=stats_text, reply_markup=buttons)
-            else:
-                await message.edit_text(text=stats_text, reply_markup=buttons)
+            await _edit_or_reply(message, stats_text, InlineKeyboardMarkup([[back_btn()]]))
 
         elif data == "cb_encode_hint":
             await callback_query.answer(
-                "Just send or forward any video file to this chat — encoding starts automatically!",
+                "Just send or forward any video file here — encoding starts automatically!",
                 show_alert=True,
             )
             return
 
         elif data == "cb_open_settings":
+            # Open the real settings menu in-place instead of telling the user
+            # to type a command (that was a dead-end UX).
             await callback_query.answer()
-            await client.send_message(
-                callback_query.from_user.id,
-                "⚙️ Send <code>/settings</code> to open your encoding settings.",
+            from plugins.settings import render_settings_menu
+
+            await render_settings_menu(
+                client, message, query=True, user_id=callback_query.from_user.id
             )
             return
 
         elif data == "cb_close":
-            await message.delete()
+            try:
+                await message.delete()
+            except Exception:
+                await safe_edit(message, f"{ICONS.close} <b>Closed.</b>\n<i>Send /start to open the menu again.</i>",
+                                InlineKeyboardMarkup([[btn(f"{ICONS.home} Home", "cb_start")]]))
+            return
+
+        elif data == "cb_queue_hint":
+            await callback_query.answer("Send /queue to open your job list.", show_alert=True)
+            return
 
         elif data.startswith("cb_err_"):
             from bot.func.encode import ERROR_DETAILS
@@ -266,10 +330,14 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
             await callback_query.answer(detail[:190], show_alert=True)
             return
 
+        else:
+            await callback_query.answer()
+            return
+
     except Exception as e:
         log.error(f"Callback '{data}' failed: {e}")
         try:
-            await callback_query.answer("⚠️ Action failed.", show_alert=True)
+            await callback_query.answer("⚠️ Action failed — please try again.", show_alert=True)
         except Exception:
             pass
         return

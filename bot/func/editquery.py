@@ -14,7 +14,6 @@ log = LOGGER(__name__)
 
 def render_queue_text(jobs, for_user: int = 0) -> str:
     """Unified queue rendering used by /queue and the in-progress view."""
-    total = 0
     lines = []
     for i, job in enumerate(jobs, 1):
         if job.status == "running":
@@ -24,24 +23,32 @@ def render_queue_text(jobs, for_user: int = 0) -> str:
             if proc is not None:
                 pct = proc.stats.percent
                 eta = proc.stats.eta
-                extra = f"\n      {pct:.1f}% · ETA {eta}"
+                filled = int(pct / 100 * 10)
+                bar = "▰" * filled + "▱" * (10 - filled)
+                extra = f"\n      <code>{bar}</code> {pct:.0f}% · ETA {eta}"
         elif job.status == "yielded":
             icon = "⏸"
-            extra = ""
+            extra = " · paused"
         else:
             icon = "⏳"
             size = job.file_size if job.file_size != "Unknown" else ""
             extra = f" · {size}" if size else ""
 
         name = escape(job.file_name or "Unknown")
+        if len(name) > 40:
+            name = name[:39] + "…"
         owner = ""
         if for_user == OWNER_ID:
             owner = f" · 👤 <code>{job.user_id}</code>"
 
         lines.append(f"{i}️⃣ {icon} <code>{name}</code>{extra}{owner}")
 
+    if not lines:
+        body = "📭 <b>Queue is empty.</b>\n<i>Send a video to start an encode.</i>"
+    else:
+        body = "\n".join(lines)
+
     header = f"📋 <b>Queue</b> · {len(jobs)} job(s)"
-    body = "\n".join(lines) if lines else "📭 <b>Queue is empty.</b>"
     return f"{header}\n\n<blockquote>{body}</blockquote>"
 
 

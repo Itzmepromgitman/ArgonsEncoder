@@ -41,7 +41,9 @@ async def screenshot_command(client: Client, message, query=False):
         await message.reply_text("❌ <b>File is not a video.</b>")
         return
 
-    status_msg = await message.reply_text("📥 <b>Downloading Video...</b>")
+    status_msg = await message.reply_text(
+        "📥 <b>Downloading video…</b>\n<i>For screenshot extraction.</i>"
+    )
 
     downloads_dir = Path("downloads")
     downloads_dir.mkdir(exist_ok=True)
@@ -67,7 +69,7 @@ async def screenshot_command(client: Client, message, query=False):
                 last_edit["t"] = now
                 try:
                     pct = current * 100 / total
-                    await status_msg.edit(f"📥 <b>Downloading...</b> {pct:.1f}%")
+                    await status_msg.edit(f"📥 <b>Downloading…</b> <code>{pct:.1f}%</code>")
                 except Exception:
                     pass
 
@@ -80,7 +82,7 @@ async def screenshot_command(client: Client, message, query=False):
             await status_msg.edit("❌ <b>Download Failed.</b>")
             return
 
-        await status_msg.edit("📸 <b>Generating Screenshots...</b>")
+        await status_msg.edit("📸 <b>Generating screenshots…</b>\n<i>Sampling 5 frames across the timeline.</i>")
 
         duration = 0
         if target_msg.video:
@@ -138,17 +140,21 @@ async def screenshot_command(client: Client, message, query=False):
             await status_msg.edit("❌ <b>Failed to generate screenshots.</b>")
             return
 
-        await status_msg.edit("📤 <b>Uploading Screenshots...</b>")
+        await status_msg.edit("📤 <b>Uploading screenshots…</b>")
 
         media_group = [
-            InputMediaPhoto(ss, caption=f"⏱ Timestamp: {timestamps[i]:.1f}s")
+            InputMediaPhoto(
+                ss,
+                caption=f"⏱ <code>{timestamps[i]:.1f}s</code>",
+            )
             for i, ss in enumerate(screenshots)
         ]
 
         media_group[0].caption = (
             f"📸 <b>Screenshots</b>\n"
             f"📁 <code>{escape(file_name)}</code>\n"
-            f"⏱ Duration: {duration:.1f}s"
+            f"⏱ Duration: <code>{duration:.1f}s</code>\n"
+            f"<i>5 frames · 20% · 35% · 50% · 65% · 80%</i>"
         )
 
         await message.reply_media_group(media_group)

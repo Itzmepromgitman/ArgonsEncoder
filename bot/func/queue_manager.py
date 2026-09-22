@@ -12,7 +12,7 @@ from database import get_variable, set_variable
 log = LOGGER(__name__)
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-SAVE_DEBOUNCE_SECONDS = 2.0
+SAVE_DEBOUNCE_SECONDS = float(os.environ.get("SAVE_DEBOUNCE_SECONDS", "2.0"))
 
 
 @dataclass

@@ -5,6 +5,7 @@ import time
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.logger import LOGGER
+from bot.utils.format import TimeFormatter, humanbytes
 
 log = LOGGER(__name__)
 
@@ -34,8 +35,8 @@ async def progress_for_pyrogram(
         time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
         estimated_total_time = elapsed_time + time_to_completion
 
-        elapsed_time_str = TimeFormatter(milliseconds=elapsed_time)
-        estimated_total_time_str = TimeFormatter(milliseconds=estimated_total_time)
+        elapsed_time_str = TimeFormatter(elapsed_time)
+        estimated_total_time_str = TimeFormatter(estimated_total_time) if estimated_total_time else "calculating…"
 
         # Enhanced progress bar
         filled = math.floor(percentage / 5)  # 20 blocks
@@ -52,18 +53,12 @@ async def progress_for_pyrogram(
         else:
             status_emoji = "▶️"
 
-        progress_text = f"""{status_emoji} <b>{ud_type}</b>
-<blockquote>
-📊 <b>Progress:</b> {percentage:.1f}%
-<code>{progress_bar}</code>
-
-📈 <b>Stats:</b>
- ├ <b>Processed:</b> {humanbytes(current)}
- ├ <b>Total:</b> {humanbytes(total)}
- ├ <b>Speed:</b> {humanbytes(speed)}/s
- ├ <b>Elapsed:</b> {elapsed_time_str}
- └ <b>ETA:</b> {estimated_total_time_str if estimated_total_time_str else "calculating..."}
-</blockquote>"""
+        progress_text = (
+            f"{status_emoji} <b>{ud_type}</b>\n"
+            f"<blockquote><code>{progress_bar}</code> <b>{percentage:.1f}%</b>\n"
+            f"📦 {humanbytes(current)} / {humanbytes(total)}\n"
+            f"⚡ {humanbytes(speed)}/s · ⏱ {elapsed_time_str} · ⏳ ETA {estimated_total_time_str}</blockquote>"
+        )
 
         try:
             await message.edit(
@@ -84,40 +79,3 @@ async def progress_for_pyrogram(
                     del _progress_state[unique_id]
             else:
                 log.error(f"Error updating progress: {e}")
-
-
-def humanbytes(size):
-    if not size or size == 0:
-        return "0 B"
-
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    size = float(size)
-    i = 0
-
-    while size >= 1024.0 and i < len(units) - 1:
-        size /= 1024.0
-        i += 1
-
-    return f"{size:.2f} {units[i]}"
-
-
-def TimeFormatter(milliseconds: int) -> str:
-    if milliseconds <= 0:
-        return "0s"
-
-    seconds, ms = divmod(int(milliseconds), 1000)
-    minutes, secs = divmod(seconds, 60)
-    hours, mins = divmod(minutes, 60)
-    days, hrs = divmod(hours, 24)
-
-    parts = []
-    if days > 0:
-        parts.append(f"{days}d")
-    if hrs > 0:
-        parts.append(f"{hrs}h")
-    if mins > 0:
-        parts.append(f"{mins}m")
-    if secs > 0 or not parts:
-        parts.append(f"{secs}s")
-
-    return " ".join(parts)

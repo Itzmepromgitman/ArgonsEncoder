@@ -6,7 +6,7 @@ import shutil
 import sys
 
 from pyrogram import Client
-from pyrogram.types import BotCommand
+from pyrogram.types import BotCommand, BotCommandScopeChat
 
 from bot.config import (
     API_HASH,
@@ -124,7 +124,10 @@ class Bot(Client):
         try:
             await self.send_message(
                 OWNER_ID,
-                text="<b><blockquote>🤖 Bᴏᴛ Rᴇsᴛᴀʀᴛᴇᴅ Sᴜᴄᴄᴇssғᴜʟʟʏ</blockquote></b>",
+                text=(
+                    "♻️ <b>Bot restarted</b>\n"
+                    "<blockquote>Queue restored · ready for jobs.</blockquote>"
+                ),
             )
         except BaseException:
             pass
@@ -153,21 +156,36 @@ class Bot(Client):
         except Exception as e:
             log.error(f"Failed to restore queue: {e}")
 
-        # Set Bot Commands
+        # Set Bot Commands — everyone gets the core set; owner also gets admin ops.
         try:
-            await self.set_bot_commands(
-                [
-                    BotCommand("start", "Start the bot"),
-                    BotCommand("settings", "Configure encoding settings"),
-                    BotCommand("queue", "Show your job queue"),
-                    BotCommand("status", "Live server status"),
-                    BotCommand("stats", "Bot statistics"),
-                    BotCommand("ss", "Generate screenshots from video"),
-                    BotCommand("cancel", "Cancel a job by ID"),
-                    BotCommand("clear", "Clear your queued jobs"),
-                    BotCommand("help", "How to use the bot"),
-                ]
-            )
+            base_commands = [
+                BotCommand("start", "🏠 Open the home menu"),
+                BotCommand("settings", "⚙️ Configure encoding"),
+                BotCommand("queue", "📋 Your job queue"),
+                BotCommand("status", "📊 Live server status"),
+                BotCommand("stats", "📈 Bot statistics"),
+                BotCommand("ss", "📸 Screenshots from a video"),
+                BotCommand("cancel", "🚫 Cancel a job by ID"),
+                BotCommand("clear", "🧹 Clear your queued jobs"),
+                BotCommand("features", "✨ Feature overview"),
+                BotCommand("help", "📚 Usage manual"),
+            ]
+            await self.set_bot_commands(base_commands)
+
+            owner_commands = base_commands + [
+                BotCommand("jobs", "🗂 All jobs (owner)"),
+                BotCommand("info", "ℹ️ Job details (owner)"),
+                BotCommand("cancelall", "💣 Cancel every job (owner)"),
+                BotCommand("admin", "💠 Admin panel"),
+                BotCommand("broadcast", "📣 Broadcast (reply to msg)"),
+                BotCommand("ban", "🚫 Ban a user"),
+                BotCommand("unban", "✅ Unban a user"),
+                BotCommand("maint", "🛠 Toggle maintenance"),
+                BotCommand("restart", "♻️ Restart the bot"),
+                BotCommand("log", "📄 Fetch logs"),
+                BotCommand("shell", "🐍 Run Python (reply)"),
+            ]
+            await self.set_bot_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
             log.info("Bot commands set successfully")
         except Exception as e:
             log.error(f"Failed to set bot commands: {e}")

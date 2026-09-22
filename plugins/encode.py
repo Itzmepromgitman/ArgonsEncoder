@@ -124,8 +124,9 @@ async def enhanced_document_handler(client: Client, message: Message):
                 f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
                 f"📦 {(fi['file_size'] or 0) / (1024 * 1024):.2f} MB · "
                 f"🏷️ {escape(fi['mime_type']) or 'unknown type'}</blockquote>\n"
-                f"<i>Unsupported format or over the "
-                f"{MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>"
+                f"<i>Unsupported format, or over the "
+                f"{MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>\n"
+                f"<i>Supported: MP4, MKV, AVI, MOV, WebM and similar.</i>"
             )
             return
 
@@ -145,7 +146,9 @@ async def enhanced_document_handler(client: Client, message: Message):
         )
         log.info(f"Download path: {download_file_path}")
 
-        download_msg = await message.reply_text("📥 <b>Downloading...</b>")
+        download_msg = await message.reply_text(
+            "📥 <b>Downloading…</b>\n<i>Fetching your file — progress updates below.</i>"
+        )
         downloaded_path = await safe_download_media(
             client, message, str(download_file_path), download_msg
         )

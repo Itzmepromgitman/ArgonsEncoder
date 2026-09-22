@@ -12,6 +12,8 @@ log = LOGGER(__name__)
 # Rate-limit state with bounded size.
 user_last_interaction = {}
 _MAX_TRACKED_USERS = 5000
+# Snappy enough for pause/cancel taps without flooding Telegram edits.
+_MIN_CALLBACK_GAP = 0.6
 
 
 def _prune_if_needed():
@@ -28,9 +30,9 @@ async def encoding_callback_handler(client: Client, callback_query: CallbackQuer
     current_time = time.time()
 
     last = user_last_interaction.get(user_id, 0)
-    if current_time - last < 2.0:
+    if current_time - last < _MIN_CALLBACK_GAP:
         await callback_query.answer(
-            "⚠️ Please wait 2 seconds between actions.", show_alert=True
+            "⏳ Hang on — tap again in a moment.", show_alert=False
         )
         return
 

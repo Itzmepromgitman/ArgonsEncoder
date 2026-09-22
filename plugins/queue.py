@@ -15,6 +15,7 @@ from bot.func.editquery import render_queue_text
 from bot.func.encode import active_encodings
 from bot.func.queue_manager import queue_manager
 from bot.logger import LOGGER
+from bot.utils.ui import ICONS, btn, close_btn, empty_state, refresh_btn, safe_edit, truncate
 
 log = LOGGER(__name__)
 
@@ -24,7 +25,24 @@ BOT_START_TIME = time.time()
 def _uptime_text() -> str:
     from bot.utils.format import format_time
 
-    return format_time((time.time() - BOT_START_TIME) * 1000)
+    return format_time((int(time.time() - BOT_START_TIME) * 1000))
+
+
+def _queue_keyboard(jobs, refresh_cb: str = "queue_view") -> InlineKeyboardMarkup:
+    """Numbered cancel buttons with a clear header action row."""
+    buttons = []
+    if jobs:
+        row = []
+        for i, job in enumerate(jobs[:9], 1):
+            row.append(btn(f"{i} 🚫", f"qcancel_{job.job_id}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([refresh_btn(refresh_cb)])
+    buttons.append([close_btn()])
+    return InlineKeyboardMarkup(buttons)
 
 
 @Client.on_message(filters.command("cancel"))
@@ -34,7 +52,9 @@ async def cancel_command(client: Client, message: Message):
         user_id = message.from_user.id
 
         if len(args) < 2:
-            await message.reply_text("⚠️ Usage: <code>/cancel JOB_ID</code>\nGet IDs from <code>/queue</code>.")
+            await message.reply_text(
+                "⚠️ Usage: <code>/cancel JOB_ID</code>\n<i>Get IDs from /queue.</i>"
+            )
             return
 
         job_id = args[1]
@@ -42,7 +62,7 @@ async def cancel_command(client: Client, message: Message):
 
         if not job:
             await message.reply_text(
-                f"❌ No job <code>{job_id}</code> found. It may have already finished."
+                f"❌ No job <code>{job_id}</code> found — it may have already finished."
             )
             return
 
@@ -66,58 +86,28 @@ async def cancel_command(client: Client, message: Message):
         await message.reply_text("❌ An error occurred.")
 
 
+def _user_queue_view(user_id: int):
+    is_owner = user_id == OWNER_ID
+    jobs = queue_manager.get_all_jobs() if is_owner else queue_manager.get_user_jobs(user_id)
+    text = render_queue_text(jobs, for_user=user_id)
+    if jobs:
+        text += "\n\n<i>Tap 🚫 next to a number to cancel that job.</i>"
+    return jobs, text
+
+
 @Client.on_message(filters.command("queue"))
 async def queue_command(client: Client, message: Message):
     user_id = message.from_user.id
-    is_owner = user_id == OWNER_ID
-
-    jobs = (
-        queue_manager.get_all_jobs() if is_owner else queue_manager.get_user_jobs(user_id)
-    )
-
-    text = render_queue_text(jobs, for_user=user_id)
-
-    buttons = []
-    if jobs:
-        # Per-job cancel buttons (max 5 per row of 3)
-        row = []
-        for i, job in enumerate(jobs[:9], 1):
-            row.append(InlineKeyboardButton(f"{i} 🚫", callback_data=f"qcancel_{job.job_id}"))
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="queue_view")])
-    buttons.append([InlineKeyboardButton("❌ Close", callback_data="cb_close")])
-
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    jobs, text = _user_queue_view(user_id)
+    await message.reply_text(text, reply_markup=_queue_keyboard(jobs))
 
 
 @Client.on_callback_query(filters.regex(r"^queue_view$"))
 async def queue_view_refresh(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    jobs = (
-        queue_manager.get_all_jobs()
-        if user_id == OWNER_ID
-        else queue_manager.get_user_jobs(user_id)
-    )
-    text = render_queue_text(jobs, for_user=user_id)
-    buttons = []
-    if jobs:
-        row = []
-        for i, job in enumerate(jobs[:9], 1):
-            row.append(InlineKeyboardButton(f"{i} 🚫", callback_data=f"qcancel_{job.job_id}"))
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="queue_view")])
-    buttons.append([InlineKeyboardButton("❌ Close", callback_data="cb_close")])
-
+    jobs, text = _user_queue_view(user_id)
     try:
-        await callback_query.message.edit(text, reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_edit(callback_query.message, text, _queue_keyboard(jobs))
     except Exception:
         pass
     await callback_query.answer()
@@ -155,7 +145,7 @@ def _status_card():
     running = [j for j in jobs if j.status in ("running", "yielded")]
     pending = len(jobs) - len(running)
 
-    cpu = psutil.cpu_percent()
+    cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage(".").percent
     free_gb = psutil.disk_usage(".").free / (1024 ** 3)
@@ -165,22 +155,28 @@ def _status_card():
         proc = active_encodings.get(job.job_id)
         pct = f"{proc.stats.percent:.0f}%" if proc else "?"
         name = job.file_name if job.file_name != "Unknown" else job.job_id
-        icon = "⏸" if job.status == "yielded" else "🎬"
-        running_lines += f"{icon} <code>{name[:28]}</code> · {pct}\n"
+        icon = ICONS.pause if job.status == "yielded" else ICONS.encode
+        running_lines += f"{icon} <code>{truncate(name, 28)}</code> · {pct}\n"
+
+    load_block = (
+        f"🖥 CPU <code>{cpu}%</code> · RAM <code>{ram}%</code>\n"
+        f"💾 Disk <code>{disk}%</code> · Free <code>{free_gb:.1f} GB</code>"
+    )
 
     text = (
-        f"📊 <b>Status</b>\n"
-        f"<blockquote>🎬 Encoding: <code>{len(running)}</code>   ⏳ Queued: <code>{pending}</code>\n"
-        f"⏱ Uptime: <code>{_uptime_text()}</code></blockquote>\n"
-        + (f"<blockquote>{running_lines}</blockquote>" if running_lines else "")
-        + f"<blockquote>🖥 CPU <code>{cpu}%</code> · RAM <code>{ram}%</code>\n"
-        f"💾 Disk <code>{disk}%</code> · Free <code>{free_gb:.1f} GB</code></blockquote>"
+        f"{ICONS.status} <b>Live status</b>\n"
+        f"<blockquote>🎬 Encoding: <code>{len(running)}</code> · ⏳ Queued: <code>{pending}</code>\n"
+        f"⏱ Uptime: <code>{_uptime_text()}</code></blockquote>"
     )
+    if running_lines:
+        text += f"\n<blockquote>{running_lines.rstrip()}</blockquote>"
+    text += f"\n<blockquote>{load_block}</blockquote>"
+
     buttons = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔄 Refresh", callback_data="st_refresh"),
-                InlineKeyboardButton("❌ Close", callback_data="cb_close"),
+                refresh_btn("st_refresh"),
+                close_btn(),
             ]
         ]
     )
@@ -191,10 +187,37 @@ def _status_card():
 async def status_refresh(client: Client, callback_query: CallbackQuery):
     text, buttons = _status_card()
     try:
-        await callback_query.message.edit(text, reply_markup=buttons)
+        await safe_edit(callback_query.message, text, buttons)
     except Exception:
         pass
     await callback_query.answer()
+
+
+def _jobs_dashboard(jobs):
+    lines = []
+    row = []
+    buttons = []
+    for i, job in enumerate(jobs[:15], 1):
+        icon = {"running": ICONS.encode, "yielded": ICONS.pause, "pending": "⏳"}.get(job.status, "•")
+        lines.append(
+            f"{i}️⃣ {icon} <code>{truncate(job.file_name, 24)}</code> · 👤 <code>{job.user_id}</code>"
+        )
+        row.append(btn(f"{i} ❌", f"qj_{job.job_id}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([refresh_btn("jobs_view")])
+    buttons.append([close_btn()])
+
+    body = "\n".join(lines)
+    text = (
+        f"{ICONS.jobs} <b>All jobs</b> · <code>{len(jobs)}</code>\n"
+        f"<blockquote>{body}</blockquote>\n"
+        f"<i>Tap a number to cancel that job.</i>"
+    )
+    return text, InlineKeyboardMarkup(buttons)
 
 
 @Client.on_message(filters.command("jobs") & filters.user(OWNER_ID))
@@ -202,27 +225,13 @@ async def jobs_command(client: Client, message: Message):
     """Owner-only fleet-wide job dashboard with per-job cancel buttons."""
     jobs = queue_manager.get_all_jobs()
     if not jobs:
-        await message.reply_text("📭 <b>No active or queued jobs.</b>")
+        await message.reply_text(
+            empty_state("No active jobs", "Queue and workers are idle.", "Upload a video to get started.")
+        )
         return
 
-    lines = []
-    buttons = []
-    row = []
-    for i, job in enumerate(jobs[:15], 1):
-        icon = {"running": "🎬", "yielded": "⏸", "pending": "⏳"}.get(job.status, "•")
-        lines.append(
-            f"{i}️⃣ {icon} <code>{job.file_name[:24]}</code> · 👤 <code>{job.user_id}</code>"
-        )
-        row.append(InlineKeyboardButton(f"{i} ❌", callback_data=f"qj_{job.job_id}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    text = f"🗂 <b>All Jobs</b> · {len(jobs)}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>"
-    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="jobs_view")])
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    text, buttons = _jobs_dashboard(jobs)
+    await message.reply_text(text, reply_markup=buttons)
 
 
 @Client.on_callback_query(filters.regex(r"^jobs_view$"))
@@ -230,36 +239,21 @@ async def jobs_view_refresh(client: Client, callback_query: CallbackQuery):
     if callback_query.from_user.id != OWNER_ID:
         await callback_query.answer("Owner only.", show_alert=True)
         return
-    # Re-render by invoking the command logic on the same message.
-    msg = callback_query.message
     jobs = queue_manager.get_all_jobs()
     if not jobs:
         try:
-            await msg.edit("📭 <b>No active or queued jobs.</b>")
+            await safe_edit(
+                callback_query.message,
+                empty_state("No active jobs", "Queue and workers are idle."),
+            )
         except Exception:
             pass
         await callback_query.answer()
         return
 
-    lines = []
-    buttons = []
-    row = []
-    for i, job in enumerate(jobs[:15], 1):
-        icon = {"running": "🎬", "yielded": "⏸", "pending": "⏳"}.get(job.status, "•")
-        lines.append(
-            f"{i}️⃣ {icon} <code>{job.file_name[:24]}</code> · 👤 <code>{job.user_id}</code>"
-        )
-        row.append(InlineKeyboardButton(f"{i} ❌", callback_data=f"qj_{job.job_id}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="jobs_view")])
-
-    text = f"🗂 <b>All Jobs</b> · {len(jobs)}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>"
+    text, buttons = _jobs_dashboard(jobs)
     try:
-        await msg.edit(text, reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_edit(callback_query.message, text, buttons)
     except Exception:
         pass
     await callback_query.answer()
@@ -312,15 +306,15 @@ async def info_command(client: Client, message: Message):
         status = status_map.get(job.status, job.status)
 
         text = (
-            f"<blockquote>ℹ️ <b>Job Information</b></blockquote>\n\n"
-            f"🆔 <b>Job ID:</b> <code>{job.job_id}</code>\n"
-            f"📊 <b>Status:</b> {status}\n\n"
-            f"<blockquote>👤 <b>User Details</b>\n"
-            f"├ <b>Name:</b> {user_text}\n"
-            f"└ <b>Username:</b> {username}</blockquote>\n\n"
-            f"<blockquote>📁 <b>File Details</b>\n"
-            f"├ <b>Name:</b> <code>{job.file_name}</code>\n"
-            f"└ <b>Size:</b> {job.file_size}</blockquote>"
+            f"{ICONS.info} <b>Job information</b>\n\n"
+            f"<blockquote>🆔 <b>ID:</b> <code>{job.job_id}</code>\n"
+            f"📊 <b>Status:</b> {status}</blockquote>\n\n"
+            f"<blockquote>👤 <b>User</b>\n"
+            f"├ Name: {user_text}\n"
+            f"└ Username: {username}</blockquote>\n\n"
+            f"<blockquote>📁 <b>File</b>\n"
+            f"├ Name: <code>{escape_filename(job.file_name)}</code>\n"
+            f"└ Size: {job.file_size}</blockquote>"
         )
 
         await message.reply_text(text)
@@ -328,6 +322,12 @@ async def info_command(client: Client, message: Message):
     except Exception as e:
         log.error(f"Error in info command: {e}")
         await message.reply_text("❌ An error occurred.")
+
+
+def escape_filename(name: str) -> str:
+    from html import escape
+
+    return escape(str(name or ""))
 
 
 @Client.on_message(filters.command("clear"))
@@ -341,28 +341,34 @@ async def clear_command(client: Client, message: Message):
             [
                 [
                     InlineKeyboardButton(
-                        f"👤 My Jobs ({count_mine})", callback_data="queue_clear_mine"
+                        f"👤 My jobs ({count_mine})", callback_data="queue_clear_mine"
                     ),
                     InlineKeyboardButton(
-                        f"🌐 ALL Jobs ({count_all})", callback_data="queue_confirm_all"
+                        f"🌐 All jobs ({count_all})", callback_data="queue_confirm_all"
                     ),
                 ],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cb_close")],
+                [close_btn("Cancel")],
             ]
         )
         await message.reply_text(
-            "⚙️ <b>Queue Control</b>\nChoose what to clear:", reply_markup=buttons
+            f"{ICONS.queue} <b>Queue control</b>\n<i>Choose what to clear:</i>",
+            reply_markup=buttons,
         )
     else:
         count = await _cancel_user_jobs(user_id)
-        await message.reply_text(f"✅ Cleared {count} of your jobs.")
+        if count:
+            await message.reply_text(f"✅ Cleared {count} of your jobs.")
+        else:
+            await message.reply_text(
+                empty_state("Nothing to clear", "You have no queued jobs.")
+            )
 
 
 @Client.on_message(filters.command("cancelall") & filters.user(OWNER_ID))
 async def cancel_all_command(client: Client, message: Message):
     count = len(queue_manager.get_all_jobs())
     await message.reply_text(
-        f"⚠️ <b>Cancel ALL {count} jobs?</b>",
+        f"⚠️ <b>Cancel all {count} jobs?</b>\n<i>This cannot be undone.</i>",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -389,7 +395,7 @@ async def queue_callback_handler(client: Client, callback_query: CallbackQuery):
     if action == "queue_clear_mine":
         count = await _cancel_user_jobs(user_id)
         try:
-            await callback_query.message.edit(f"✅ Cleared {count} of your jobs.")
+            await safe_edit(callback_query.message, f"✅ Cleared {count} of your jobs.")
         except Exception:
             pass
         await callback_query.answer()
@@ -397,7 +403,7 @@ async def queue_callback_handler(client: Client, callback_query: CallbackQuery):
     elif action == "queue_confirm_all":
         count = await _cancel_all_jobs()
         try:
-            await callback_query.message.edit(f"✅ Cancelled ALL jobs ({count}).")
+            await safe_edit(callback_query.message, f"✅ Cancelled all jobs ({count}).")
         except Exception:
             pass
         await callback_query.answer()

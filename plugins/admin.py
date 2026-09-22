@@ -19,6 +19,7 @@ from bot.decorator import invalidate_user_caches, is_admin
 from bot.logger import LOGGER, send_logs
 from bot.utils.restart import restart_bot
 from bot.utils.shell import shell_command
+from bot.utils.ui import ICONS, btn, close_btn, safe_edit
 from database import full_userbase, del_user, get_variable, set_variable
 
 log = LOGGER(__name__)
@@ -29,11 +30,11 @@ async def handle_restart(client, message):
     if message.from_user.id != OWNER_ID:
         return
     try:
-        await message.reply_text("🔄 Restarting...")
+        await message.reply_text("🔄 Restarting… I'll ping you when I'm back.")
         await restart_bot(client, message)
     except Exception as e:
         log.error(e)
-        await message.reply_text(f"Error: <code>{e}</code>")
+        await message.reply_text(f"❌ Restart failed: <code>{e}</code>")
 
 
 @Client.on_message(filters.command("log") & filters.private)
@@ -114,8 +115,30 @@ async def maint_command(client, message):
     current = await get_variable("maintenance", False)
     new_state = not current
     await set_variable("maintenance", new_state)
-    state_txt = "🛠 <b>Maintenance mode ENABLED</b>\n<i>New jobs are rejected; running jobs continue.</i>" if new_state else "✅ <b>Maintenance mode DISABLED</b>\n<i>The bot accepts new jobs again.</i>"
+    if new_state:
+        state_txt = (
+            f"{ICONS.warn} <b>Maintenance enabled</b>\n"
+            "<blockquote>New jobs are rejected; running jobs finish normally.</blockquote>"
+        )
+    else:
+        state_txt = (
+            f"{ICONS.success} <b>Maintenance disabled</b>\n"
+            "<blockquote>The bot accepts new jobs again.</blockquote>"
+        )
     await message.reply_text(state_txt)
+
+
+def _broadcast_status_card(total, successful, blocked, deleted, unsuccessful, done=False) -> str:
+    title = "Broadcast completed" if done else "Broadcast in progress"
+    icon = ICONS.success if done else ICONS.upload
+    return (
+        f"{icon} <b>{title}</b>\n"
+        f"<blockquote>👥 Total users: <code>{total}</code>\n"
+        f"✅ Successful: <code>{successful}</code>\n"
+        f"🚫 Blocked: <code>{blocked}</code>\n"
+        f"👻 Deactivated: <code>{deleted}</code>\n"
+        f"⚠️ Unsuccessful: <code>{unsuccessful}</code></blockquote>"
+    )
 
 
 @Client.on_message(filters.command("broadcast") & filters.private)
@@ -124,27 +147,31 @@ async def broadcast_command(client, message):
         return
 
     if not message.reply_to_message:
-        await message.reply_text("Reply to a message to broadcast it.")
+        await message.reply_text(
+            "⚠️ Reply to the message you want to broadcast.",
+            reply_markup=InlineKeyboardMarkup([[close_btn()]]),
+        )
         return
 
     query = await full_userbase()
     broadcast_msg = message.reply_to_message
 
-    total = 0
     successful = 0
     blocked = 0
     deleted = 0
     unsuccessful = 0
+    total = 0
     edit = 0
 
     pls_wait = await message.reply(
-        "<i>Select broadcast type</i>",
+        "<b>📣 Broadcast setup</b>\n<blockquote>Choose how to deliver this message.</blockquote>",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton("📢 Normal", callback_data="broadcast_normal"),
                     InlineKeyboardButton("📌 Pin", callback_data="broadcast_pin"),
-                ]
+                ],
+                [close_btn("Cancel")],
             ]
         ),
     )
@@ -156,13 +183,16 @@ async def broadcast_command(client, message):
             timeout=30,
         )
     except asyncio.TimeoutError:
-        await pls_wait.edit("<i>⏰ Timed out. Please try again.</i>")
+        await pls_wait.edit("⏰ Broadcast timed out — run /broadcast again.")
         return
 
     await callback.answer()
 
     pin = 1 if callback.data == "broadcast_pin" else 0
-    await pls_wait.edit("<i>📤 Broadcast started...</i>")
+    await pls_wait.edit(
+        _broadcast_status_card(len(query), 0, 0, 0, 0),
+        reply_markup=InlineKeyboardMarkup([[close_btn("Hide")]]),
+    )
 
     for chat_id in query:
         try:
@@ -193,23 +223,17 @@ async def broadcast_command(client, message):
 
         if edit >= 20:
             edit = 0
-            status = f"""<b><u>Broadcast in progress</u>
+            try:
+                await pls_wait.edit_text(
+                    _broadcast_status_card(total, successful, blocked, deleted, unsuccessful)
+                )
+            except Exception:
+                pass
 
-Total Users: <code>{total}</code>
-Successful: <code>{successful}</code>
-Blocked Users: <code>{blocked}</code>
-Deleted Accounts: <code>{deleted}</code>
-Unsuccessful: <code>{unsuccessful}</code></b>"""
-            await pls_wait.edit_text(status)
-
-    status = f"""<b><u>Broadcast Completed</u>
-
-Total Users: <code>{total}</code>
-Successful: <code>{successful}</code>
-Blocked Users: <code>{blocked}</code>
-Deleted Accounts: <code>{deleted}</code>
-Unsuccessful: <code>{unsuccessful}</code></b>"""
-    await pls_wait.edit_text(status)
+    await pls_wait.edit_text(
+        _broadcast_status_card(total, successful, blocked, deleted, unsuccessful, done=True),
+        reply_markup=InlineKeyboardMarkup([[close_btn("Close")]]),
+    )
 
 
 @Client.on_message(filters.command("admin") & filters.private)
@@ -218,27 +242,37 @@ async def admin(client, message):
         return
 
     a = await get_variable("admin", [])
+    admin_list = (
+        "\n".join(f"• <code>{x}</code>" for x in a) if a else "<i>No extra admins yet.</i>"
+    )
     txt = (
-        f"<blockquote expandable>💠 𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋  ♻️\n</blockquote>\n"
-        f"<blockquote expandable>🚩 𝐀𝐃𝐌𝐈𝐍 :- {a}\n</blockquote>\n"
-        f"<blockquote expandable>⚠️ 𝐍𝐎𝐓𝐄 - ADMINS CAN USE ALL BOT COMMANDS EXCEPT FSUB, ADMIN ‼️</blockquote>"
+        f"{ICONS.admin} <b>Admin panel</b>\n\n"
+        f"<blockquote><b>Admins</b>\n{admin_list}</blockquote>\n"
+        f"<i>Admins can use bot commands except owner-only ops "
+        f"(/admin, /shell, /restart, /jobs).</i>"
     )
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("𝐀𝐃𝐃 𝐀𝐃𝐌𝐈𝐍", callback_data="admin_add"),
-                InlineKeyboardButton("𝐑𝐄𝐌𝐎𝐕𝐄 𝐀𝐃𝐌𝐈𝐍", callback_data="admin_rem"),
+                InlineKeyboardButton("➕ Add admin", callback_data="admin_add"),
+                InlineKeyboardButton("➖ Remove admin", callback_data="admin_rem"),
             ],
-            [
-                InlineKeyboardButton("ϲℓοѕє", callback_data="cb_close"),
-            ],
+            [InlineKeyboardButton("♻️ Refresh", callback_data="admin_refresh")],
+            [close_btn()],
         ]
     )
-    await message.reply_photo(
-        photo="https://i.ibb.co/kVwykh4J/ce566244dba9.jpg",
-        caption=txt,
-        reply_markup=keyboard,
-    )
+
+    # Prefer editing an existing panel message when opened via Refresh.
+    if message.photo or (message.caption and "Admin panel" in (message.caption or "")):
+        try:
+            await message.edit_caption(caption=txt, reply_markup=keyboard)
+            return
+        except Exception:
+            pass
+    if await safe_edit(message, txt, keyboard):
+        return
+
+    await message.reply_text(txt, reply_markup=keyboard)
 
 
 async def _parse_target_input(a):
@@ -255,135 +289,116 @@ async def _parse_target_input(a):
         return None, "Invalid input! Please send a valid user ID."
 
 
+ADD_ADMIN_PROMPT = (
+    f"{ICONS.admin} <b>Add an admin</b>\n\n"
+    "<blockquote expandable><b>How</b>\n"
+    "1. Forward a message from the target user, <b>or</b>\n"
+    "2. Send their numeric user ID</blockquote>\n"
+    "<i>Make sure the ID is valid · press Cancel to abort.</i>"
+)
+
+REM_ADMIN_PROMPT = (
+    f"{ICONS.admin} <b>Remove an admin</b>\n\n"
+    "<blockquote expandable><b>How</b>\n"
+    "1. Forward a message from the target user, <b>or</b>\n"
+    "2. Send their numeric user ID</blockquote>\n"
+    "<i>Make sure the ID is valid · press Cancel to abort.</i>"
+)
+
+
 @Client.on_callback_query(filters.regex("^admin_"))
 async def admin2(client, query):
     uid = query.from_user.id
-    user_id = uid
 
     if uid != OWNER_ID:
-        await query.answer(
-            "❌ ϐακκα!, γου αяє иοτ αℓℓοωє∂ το υѕє τнє ϐυττοи", show_alert=True
-        )
+        await query.answer("⛔ Owner only.", show_alert=True)
         return
 
     action = query.data.split("_")[1]
 
-    txt = (
-        "<blockquote expandable>⚠️ <b>𝖣𝗈 𝖮𝗇𝖾 𝖡𝖾𝗅𝗈𝗐</b> ⚠️</blockquote>\n"
-        "<blockquote expandable><i>🔱 𝖥𝗈𝗋𝗐𝖺𝗋𝖽 𝖠 𝖬𝖾𝗌𝗌𝖺𝗀𝖾 𝖥𝗋𝗈𝗆 𝖠𝖽𝗆𝗂𝗇</i></blockquote>\n"
-        "<blockquote expandable><i>💠 𝖲𝖾𝗇𝖽 𝖬𝖾 𝖠𝖽𝗆𝗂𝗇 𝖨𝖣</i></blockquote>"
-        "<blockquote>♨️ 𝗠𝗔𝗞𝗘 𝗦𝗨𝗥𝗘 𝗔𝗗𝗠𝗜𝗡 𝗜𝗗 𝗜𝗦 𝗩𝗔𝗟𝗜𝗗 ♨️</blockquote>"
-    )
+    if action == "refresh":
+        await query.answer()
+        await admin(client, query.message)
+        return
 
-    if action == "add":
-        while True:
-            b = await client.send_message(
-                uid,
-                text=txt,
-                reply_markup=ReplyKeyboardMarkup(
-                    [["❌ Cancel"]], one_time_keyboard=True, resize_keyboard=True
-                ),
+    if action not in ("add", "rem"):
+        await query.answer("Invalid action.", show_alert=True)
+        return
+
+    txt = ADD_ADMIN_PROMPT if action == "add" else REM_ADMIN_PROMPT
+
+    while True:
+        b = await client.send_message(
+            uid,
+            text=txt,
+            reply_markup=ReplyKeyboardMarkup(
+                [["❌ Cancel"]], one_time_keyboard=True, resize_keyboard=True
+            ),
+        )
+        try:
+            a = await client.listen(chat_id=uid, timeout=30)
+        except ListenerTimeout:
+            await client.send_message(
+                chat_id=uid,
+                text="⏰ Timed out — admin setup cancelled.",
+                reply_markup=ReplyKeyboardRemove(),
             )
-            try:
-                a = await client.listen(chat_id=uid, timeout=30)
-            except ListenerTimeout:
-                await client.send_message(
-                    chat_id=uid,
-                    text="⏳ Timeout! Admin Setup cancelled.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                await b.delete()
-                break
+            await b.delete()
+            break
 
-            if a.text and a.text.lower() == "❌ cancel":
-                await client.send_message(
-                    chat_id=uid,
-                    text="❌ Admin setup cancelled.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                await b.delete()
-                break
+        if a.text and a.text.lower() == "❌ cancel":
+            await client.send_message(
+                chat_id=uid,
+                text="🚫 Admin setup cancelled.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await b.delete()
+            break
 
-            chat_id, err = await _parse_target_input(a)
-            if err:
-                await client.send_message(user_id, err)
-                await b.delete()
-                continue
+        chat_id, err = await _parse_target_input(a)
+        if err:
+            await client.send_message(uid, f"❌ {err}")
+            await b.delete()
+            continue
 
-            admin1 = await get_variable("admin", [])
+        admin1 = await get_variable("admin", [])
 
+        if action == "add":
             if chat_id in admin1:
-                await client.send_message(user_id, "User is already admin; resend a correct ID...")
+                await client.send_message(uid, "⚠️ Already an admin — send a different ID…")
                 await b.delete()
                 continue
             admin1.append(chat_id)
-
-            await set_variable("admin", admin1)
-            invalidate_user_caches()
-            await b.delete()
-            await client.send_message(
-                user_id,
-                f"✅ User {chat_id} added to admins.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await admin(client, query.message)
-            await query.message.delete()
-            break
-
-    elif action == "rem":
-        while True:
-            b = await client.send_message(
-                uid,
-                text=txt,
-                reply_markup=ReplyKeyboardMarkup(
-                    [["❌ Cancel"]], one_time_keyboard=True, resize_keyboard=True
-                ),
-            )
-            try:
-                a = await client.listen(chat_id=uid, timeout=30)
-            except ListenerTimeout:
-                await client.send_message(
-                    chat_id=uid,
-                    text="⏳ Timeout! Admin Setup cancelled.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                await b.delete()
-                break
-
-            if a.text and a.text.lower() == "❌ cancel":
-                await client.send_message(
-                    chat_id=uid,
-                    text="❌ Admin setup cancelled.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                await b.delete()
-                break
-
-            chat_id, err = await _parse_target_input(a)
-            if err:
-                await client.send_message(user_id, err)
-                await b.delete()
-                continue
-
-            admin1 = await get_variable("admin", [])
-
+        else:
             if chat_id not in admin1:
-                await client.send_message(user_id, "User is not admin; resend a correct ID....")
+                await client.send_message(uid, "⚠️ Not an admin — send a different ID…")
                 await b.delete()
                 continue
             admin1.remove(chat_id)
 
-            await set_variable("admin", admin1)
-            invalidate_user_caches()
-            await b.delete()
-            await client.send_message(
-                user_id,
-                f"✅ User {chat_id} removed from admins.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await admin(client, query.message)
-            await query.message.delete()
-            break
+        await set_variable("admin", admin1)
+        invalidate_user_caches()
+        await b.delete()
 
-    else:
-        await query.answer("Invalid action.", show_alert=True)
+        verb = "added to" if action == "add" else "removed from"
+        await client.send_message(
+            uid,
+            f"✅ User <code>{chat_id}</code> {verb} the admin list.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+        # Drop the old panel (if any) and send a fresh one.
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        # Build a synthetic message-like call: re-send the panel.
+        class _M:
+            def __init__(self, chat_id):
+                self.chat = type("C", (), {"id": chat_id})()
+                self.photo = None
+                self.caption = None
+            async def reply_text(self, text, reply_markup=None):
+                return await client.send_message(chat_id, text, reply_markup=reply_markup)
+        await admin(client, _M(uid))
+        break

@@ -1,4 +1,5 @@
 # Developed by ARGON telegram: @REACTIVEARGON
+import time as _time
 from datetime import datetime, time
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -7,6 +8,12 @@ from bot.config import DB_NAME, DB_URI
 from bot.logger import LOGGER
 
 log = LOGGER(__name__)
+
+# Short-TTL cache so encode workers / settings menus don't hammer Mongo.
+# Invalidated on every write via update_user_settings().
+_settings_cache: dict = {}
+_settings_cache_ttl = 30.0  # seconds
+
 
 # --- Internal Helpers ---
 
@@ -58,6 +65,7 @@ async def add_user(user_id: int):
 async def del_user(user_id: int):
     try:
         await user_data.delete_one({"_id": user_id})
+        _settings_cache.pop(user_id, None)
     except Exception as e:
         log.error(f"Error deleting user {user_id}: {e}")
 
@@ -81,15 +89,20 @@ async def full_userbase():
 
 
 async def get_user_settings(user_id: int):
-    """Retrieve user settings from the database."""
+    """Retrieve user settings from the database (TTL-cached)."""
+    cached = _settings_cache.get(user_id)
+    if cached is not None and (_time.time() - cached[0]) < _settings_cache_ttl:
+        # Return a shallow-ish copy so callers can mutate freely.
+        return cached[1]
     try:
         user = await user_data.find_one({"_id": user_id})
-        if user and "settings" in user:
-            return user["settings"]
-        return {}
+        settings = user.get("settings") if user and "settings" in user else {}
+        settings = settings or {}
+        _settings_cache[user_id] = (_time.time(), settings)
+        return settings
     except Exception as e:
         log.error(f"Error getting settings for {user_id}: {e}")
-        return {}
+        return cached[1] if cached else {}
 
 
 async def update_user_settings(user_id: int, settings: dict) -> bool:
@@ -98,6 +111,7 @@ async def update_user_settings(user_id: int, settings: dict) -> bool:
         await user_data.update_one(
             {"_id": user_id}, {"$set": {"settings": settings}}, upsert=True
         )
+        _settings_cache[user_id] = (_time.time(), settings)
         return True
     except Exception as e:
         log.error(f"Error updating settings for {user_id}: {e}")

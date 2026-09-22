@@ -388,8 +388,23 @@ def generate_ffmpeg_cmd(
         cmd.extend(["-threads", str(FFMPEG_THREADS)])
 
         # Output path is appended by FFmpegProcess.start() along with -y.
+        # Streamable delivery prefers MP4 + faststart for instant playback.
         suffix = f"_{res}" if len(resolutions) > 1 else ""
-        output_path = f"{output_base}{suffix}.mkv"
+        if settings.get("output_as_video"):
+            ext = ".mp4"
+            # faststart moves the moov atom to the file head so Telegram can
+            # stream the result immediately after upload.
+            if not remux:
+                cmd.extend(["-movflags", "+faststart"])
+            elif remux:
+                # remux into mp4 also benefits from faststart
+                cmd.extend(["-movflags", "+faststart"])
+        else:
+            ext = ".mkv"
+        # Avoid rare "queue full" failures on complex graphs.
+        if not remux and "-max_muxing_queue_size" not in cmd:
+            cmd.extend(["-max_muxing_queue_size", "4096"])
+        output_path = f"{output_base}{suffix}{ext}"
 
         commands.append(
             {
