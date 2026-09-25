@@ -20,19 +20,19 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from bot.config import (
     DOWNLOAD_DIR,
     FFMPEG_BIN,
-    FFPROBE_BIN,
     FFMPEG_WALL_TIMEOUT,
+    FFPROBE_BIN,
     LOG_CHANNEL,
-    MAX_FILE_SIZE,
     LOG_DELIVERIES,
+    MAX_FILE_SIZE,
     MAX_MEDIA_DURATION,
     MAX_OUTPUT_SIZE,
     MAX_RECOVERY_DISK_BYTES,
     PAUSED_JOB_TTL,
-    UPLOAD_RETRY_CAP,
-    UPLOAD_RETRY_PER_USER,
     THUMB_DIR,
     UI_UPDATE_INTERVAL,
+    UPLOAD_RETRY_CAP,
+    UPLOAD_RETRY_PER_USER,
 )
 from bot.func.download_manager import download_manager
 from bot.func.ffmpeg_utils import generate_ffmpeg_cmd
@@ -1856,7 +1856,10 @@ def reconstruct_worker(job, client: Client):
                 source_duration = 0.0
             settings = normalize_settings(await get_user_settings(job.user_id))
 
-            from bot.func.ffmpeg_utils import prepare_thumbnail, prepare_watermark_assets
+            from bot.func.ffmpeg_utils import (
+                prepare_thumbnail,
+                prepare_watermark_assets,
+            )
 
             prepare_watermark_assets(job.user_id, settings)
             thumbnail_path = prepare_thumbnail(job.user_id, settings)

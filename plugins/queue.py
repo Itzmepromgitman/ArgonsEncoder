@@ -19,7 +19,15 @@ from bot.func.encode import active_encodings
 from bot.func.queue_manager import queue_manager
 from bot.func.upload_manager import upload_manager
 from bot.logger import LOGGER
-from bot.utils.ui import ICONS, btn, close_btn, empty_state, refresh_btn, safe_edit, truncate
+from bot.utils.ui import (
+    ICONS,
+    btn,
+    close_btn,
+    empty_state,
+    refresh_btn,
+    safe_edit,
+    truncate,
+)
 
 log = LOGGER(__name__)
 

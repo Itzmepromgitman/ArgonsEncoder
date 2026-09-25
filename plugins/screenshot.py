@@ -21,11 +21,11 @@ from bot.config import (
     MIN_OUTPUT_RESERVATION_BYTES,
 )
 from bot.decorator import task
-from database import is_user_tombstoned, privacy_admission_lock
-from bot.func.queue_manager import queue_manager
 from bot.func.encode import probe_file, safe_download_media, sanitize_filename
+from bot.func.queue_manager import queue_manager
 from bot.logger import LOGGER
 from bot.utils.format import humanbytes
+from database import is_user_tombstoned, privacy_admission_lock
 
 log = LOGGER(__name__)
 _SCREENSHOT_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)

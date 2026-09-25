@@ -3,10 +3,10 @@ import asyncio
 import os
 import shlex
 import uuid
+
 from bot.config import FFMPEG_BIN, MAX_CONCURRENT_JOBS, WATERMARK_DIR
 from bot.func.ffmpeg_utils import generate_watermark_filter, prepare_watermark_assets
 from bot.logger import LOGGER
-
 
 log = LOGGER(__name__)
 _PREVIEW_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)

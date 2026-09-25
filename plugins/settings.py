@@ -15,7 +15,6 @@ except ImportError:
 
 from bot.config import THUMB_DIR, WATERMARK_DIR
 from bot.decorator import is_banned, task
-from bot.func.media import prepare_telegram_thumbnail
 from bot.func.ffmpeg_utils import (
     VALID_AUDIO_CODECS,
     VALID_CODECS,
@@ -24,6 +23,7 @@ from bot.func.ffmpeg_utils import (
     sanitize_custom_name,
     validate_ffmpeg_command,
 )
+from bot.func.media import prepare_telegram_thumbnail
 from bot.logger import LOGGER
 from bot.utils.listener import ListenerBusy, cancel_session, listen_once
 from bot.utils.settings import (

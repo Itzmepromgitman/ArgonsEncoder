@@ -4,11 +4,12 @@ import uuid
 from html import escape
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
+
 try:
     from pyrogram.errors.pyromod.listener_timeout import ListenerTimeout
 except ImportError:

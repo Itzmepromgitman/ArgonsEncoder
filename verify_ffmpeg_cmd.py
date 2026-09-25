@@ -22,7 +22,6 @@ def test_generate_ffmpeg_cmd():
     assert cmd.count("/tmp/in.mkv") == 1, "input must appear exactly once"
     assert "-c:v libx264" in cmd
     assert "-crf 23" in cmd
-    assert "-nostats" not in cmd or True
     assert commands[0]["output_file"] == "/tmp/out.mkv"
     print("PASS: single-res x264 command")
     return commands

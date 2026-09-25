@@ -46,6 +46,7 @@ def main():
     # Reinstall requirements only when the file actually changed.
     diff = subprocess.run(
         ["git", "diff", "HEAD@{1}", "HEAD", "--name-only"],
+        check=False,
         capture_output=True,
         text=True,
     )

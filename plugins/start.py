@@ -489,8 +489,8 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
                 complete_upload_retry_claim,
                 restore_upload_retry,
             )
-            from bot.func.upload_manager import upload_manager
             from bot.func.queue_manager import queue_manager
+            from bot.func.upload_manager import upload_manager
             from database import is_user_tombstoned, privacy_admission_lock
 
             error_key = data.replace("cb_retry_upload_", "", 1)

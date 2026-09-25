@@ -23,6 +23,7 @@ from bot.config import (
     WATERMARK_DIR,
     validate_config,
 )
+
 from .logger import LOGGER, tg_handler
 
 log = LOGGER(__name__)
@@ -222,8 +223,8 @@ class Bot(Client):
         # Restore queue immediately after the client is live so restored jobs
         # are known before user traffic flows in.
         try:
-            from database import privacy_admission_lock
             from bot.func.queue_manager import queue_manager
+            from database import privacy_admission_lock
 
             async with privacy_admission_lock:
                 restored_ok = await queue_manager.restore_queue(self)
@@ -235,8 +236,8 @@ class Bot(Client):
             raise
 
         try:
-            from database import privacy_admission_lock
             from bot.func.encode import UPLOAD_RECOVERY_HEALTHY, restore_upload_retries
+            from database import privacy_admission_lock
 
             async with privacy_admission_lock:
                 recovered = await restore_upload_retries(self)
@@ -331,8 +332,8 @@ class Bot(Client):
             if not _persist_upload_retries():
                 log.error("Final upload recovery manifest could not be persisted")
                 if UPLOAD_RETRY or UPLOAD_INFLIGHT or UPLOAD_MANIFEST_ONLY:
-                    from bot.func.upload_manager import upload_manager
                     from bot.func.queue_manager import queue_manager
+                    from bot.func.upload_manager import upload_manager
 
                     upload_manager.resume()
                     queue_manager.resume()
@@ -342,11 +343,15 @@ class Bot(Client):
         except Exception as e:
             log.error(f"Upload retry save failed: {e}")
             try:
-                from bot.func.encode import UPLOAD_INFLIGHT, UPLOAD_MANIFEST_ONLY, UPLOAD_RETRY
+                from bot.func.encode import (
+                    UPLOAD_INFLIGHT,
+                    UPLOAD_MANIFEST_ONLY,
+                    UPLOAD_RETRY,
+                )
 
                 if UPLOAD_RETRY or UPLOAD_INFLIGHT or UPLOAD_MANIFEST_ONLY:
-                    from bot.func.upload_manager import upload_manager
                     from bot.func.queue_manager import queue_manager
+                    from bot.func.upload_manager import upload_manager
 
                     upload_manager.resume()
                     queue_manager.resume()

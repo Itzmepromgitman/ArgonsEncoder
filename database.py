@@ -4,9 +4,9 @@ import copy
 import hashlib
 import os
 import time as _time
-from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -211,11 +211,8 @@ async def _forget_user_data_impl(user_id: int) -> bool:
         durable_ok = False
         log.error(f"Could not write privacy tombstone for {user_id}: {exc}")
     try:
-        from bot.config import (
-            DOWNLOAD_DIR as download_dir,
-            THUMB_DIR,
-            WATERMARK_DIR,
-        )
+        from bot.config import DOWNLOAD_DIR as download_dir
+        from bot.config import THUMB_DIR, WATERMARK_DIR
 
         # Stop active and queued work before removing files and retry entries.
         try:
