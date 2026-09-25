@@ -8,6 +8,7 @@ from bot.config import OWNER_ID
 from bot.func.encode import active_encodings, resume_encoding_job
 from bot.func.queue_manager import queue_manager
 from bot.logger import LOGGER
+from bot.utils.ui import progress_bar
 
 log = LOGGER(__name__)
 
@@ -15,7 +16,9 @@ log = LOGGER(__name__)
 def render_queue_text(jobs, for_user: int = 0) -> str:
     """Unified queue rendering used by /queue and the in-progress view."""
     lines = []
-    for i, job in enumerate(jobs, 1):
+    jobs = list(jobs)
+    visible_jobs = jobs[:20]
+    for i, job in enumerate(visible_jobs, 1):
         if job.status == "running":
             icon = "🎬"
             proc = active_encodings.get(job.job_id)
@@ -23,8 +26,7 @@ def render_queue_text(jobs, for_user: int = 0) -> str:
             if proc is not None:
                 pct = proc.stats.percent
                 eta = proc.stats.eta
-                filled = int(pct / 100 * 10)
-                bar = "▰" * filled + "▱" * (10 - filled)
+                bar = progress_bar(pct, width=10)
                 extra = f"\n      <code>{bar}</code> {pct:.0f}% · ETA {eta}"
         elif job.status == "yielded":
             icon = "⏸"
@@ -32,21 +34,26 @@ def render_queue_text(jobs, for_user: int = 0) -> str:
         else:
             icon = "⏳"
             size = job.file_size if job.file_size != "Unknown" else ""
-            extra = f" · {size}" if size else ""
+            extra = f" · {escape(str(size))}" if size else ""
+            extra += f" · position {i}"
 
-        name = escape(job.file_name or "Unknown")
-        if len(name) > 40:
-            name = name[:39] + "…"
+        name = escape((job.file_name or "Unknown")[:40])
+        if len(job.file_name or "Unknown") > 40:
+            name = name[:-1] + "…" if len(name) > 1 else "…"
         owner = ""
         if for_user == OWNER_ID:
             owner = f" · 👤 <code>{job.user_id}</code>"
 
-        lines.append(f"{i}️⃣ {icon} <code>{name}</code>{extra}{owner}")
+        lines.append(
+            f"{i}️⃣ {icon} <code>{name}</code>{extra}{owner} · ID <code>{job.job_id}</code>"
+        )
 
     if not lines:
         body = "📭 <b>Queue is empty.</b>\n<i>Send a video to start an encode.</i>"
     else:
         body = "\n".join(lines)
+        if len(jobs) > len(visible_jobs):
+            body += f"\n<i>… {len(jobs) - len(visible_jobs)} more jobs hidden. Use /status for a compact overview.</i>"
 
     header = f"📋 <b>Queue</b> · {len(jobs)} job(s)"
     return f"{header}\n\n<blockquote>{body}</blockquote>"
@@ -82,6 +89,7 @@ async def handle_encoding_callback(client: Client, callback_query: CallbackQuery
                 # Yielded: supersede the paused queue row, then re-queue a
                 # resume task (the duplicate guard would otherwise block it).
                 old = queue_manager.get_job(process.job_id)
+                resume_reserved = int(getattr(old, "reserved_bytes", 0) or 0)
                 if old is not None and old.status == "yielded":
                     queue_manager._jobs.pop(process.job_id, None)
                     queue_manager.mark_dirty()
@@ -93,10 +101,21 @@ async def handle_encoding_callback(client: Client, callback_query: CallbackQuery
                     process.user_id,
                     resume_worker,
                     process.job_id,
+                    job_id=process.job_id,
+                    file_size=process.original_size,
                     file_name=process.file_name,
+                    chat_id=process.chat_id,
+                    message_id=process.message_id,
                     task_type="resume",
+                    input_file=process.input_file,
+                    output_file=process.output_file,
+                    source_id=process.source_id,
+                    reserved_bytes=resume_reserved,
                 )
                 if queued_id is None:
+                    if old is not None:
+                        queue_manager._jobs[process.job_id] = old
+                        queue_manager.mark_dirty()
                     await callback_query.answer(
                         "⚠️ Could not re-queue resume (duplicate/limit).",
                         show_alert=True,
@@ -124,39 +143,47 @@ async def handle_encoding_callback(client: Client, callback_query: CallbackQuery
                 except Exception as e:
                     log.error(f"Failed to edit message in callback: {e}")
             else:
-                await process.resume()
-                await callback_query.answer("▶️ Resumed")
+                resumed = await process.resume()
+                await callback_query.answer(
+                    "▶️ Resumed" if resumed else "⚠️ Could not resume the encoder.",
+                    show_alert=not resumed,
+                )
         else:
-            await process.pause()
-            await callback_query.answer("⏸ Paused")
+            paused = await process.pause()
+            await callback_query.answer(
+                "⏸ Paused" if paused else "⚠️ Could not pause the encoder.",
+                show_alert=not paused,
+            )
 
     elif action == "cancel":
         was_paused = process.is_paused
-        await process.cancel()
-
-        if was_paused and process.yield_queue:
-            # Nobody monitors a yielded process; clean up manually.
+        cancelled = await queue_manager.cancel_job(job_id)
+        if was_paused:
             try:
                 await process.message.edit("🚫 <b>Encoding Cancelled</b>")
             except Exception:
                 pass
-            try:
-                if process.input_file and os_path_exists(process.input_file):
-                    os_remove(process.input_file)
-                if process.output_file and os_path_exists(process.output_file):
-                    os_remove(process.output_file)
-            except Exception as e:
-                log.error(f"Failed to clean yielded job files: {e}")
-            active_encodings.pop(job_id, None)
 
-        await callback_query.answer("🚫 Cancelled")
+        await callback_query.answer(
+            "🚫 Cancelled" if cancelled else "⚠️ Job is already finishing; cancellation was requested."
+        )
 
     elif action == "queue":
         process.is_viewing_queue = True
-        jobs = queue_manager.get_all_jobs()
+        jobs = (
+            queue_manager.get_all_jobs()
+            if uid == OWNER_ID
+            else queue_manager.get_user_jobs(uid)
+        )
         text = render_queue_text(jobs, for_user=uid)
-        buttons = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Back", callback_data=f"enc_back_{job_id}")]]
+        from bot.func.upload_manager import upload_manager
+        from plugins.queue import _queue_keyboard
+
+        buttons = _queue_keyboard(
+            jobs,
+            refresh_cb="queue_view",
+            back_cb=f"enc_back_{job_id}",
+            upload_cancel=bool(upload_manager.get_user_jobs(uid)),
         )
         try:
             await process.message.edit(text, reply_markup=buttons)

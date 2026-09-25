@@ -4,7 +4,14 @@ import re
 import shlex
 from typing import Dict, List, Optional
 
-from bot.config import FFMPEG_THREADS, FONT_PATH, WATERMARK_DIR
+from bot.config import (
+    FFMPEG_BIN,
+    FFMPEG_THREADS,
+    FONT_PATH,
+    MAX_OUTPUT_SIZE,
+    THUMB_DIR,
+    WATERMARK_DIR,
+)
 from bot.logger import LOGGER
 
 log = LOGGER(__name__)
@@ -18,24 +25,118 @@ VALID_AUDIO_CODECS = {"aac", "ac3", "copy"}
 
 
 def validate_ffmpeg_command(cmd: str) -> bool:
-    """
-    Validates a custom FFmpeg command for safety.
-    Blocks usage of -i (input) and -y (overwrite) as these are handled by the bot.
-    """
-    try:
-        args = shlex.split(cmd)
-        forbidden_flags = ["-i", "-y"]
+    """Validate a bounded, encoder-only FFmpeg override.
 
-        for arg in args:
-            if arg in forbidden_flags:
-                return False
+    Input/output selection, stream mapping, and container destinations are
+    managed by the bot.  Values are checked semantically as well as by option
+    name so a custom command cannot use an apparently harmless flag to discard
+    arbitrary streams or create an unbounded resource request.
+    """
+    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 1000:
+        return False
 
-        if not cmd.strip():
+    flags_without_values = {
+        "-copyts", "-start_at_zero",
+    }
+    flags_with_values = {
+        "-crf", "-preset", "-b:v",
+        "-b:a", "-cpu-used", "-qscale:v", "-profile:v", "-level", "-tag:v",
+        "-pix_fmt", "-r", "-g", "-keyint_min", "-sc_threshold", "-movflags",
+        "-max_muxing_queue_size", "-threads", "-metadata", "-metadata:s:v",
+        "-metadata:s:a", "-metadata:s:s",
+    }
+    allowed = flags_without_values | flags_with_values
+    metadata_keys = {
+        "title", "artist", "album", "album_artist", "genre", "track", "disc", "date",
+        "year", "comment", "description", "composer", "performer", "publisher",
+        "lyrics", "synopsis", "copyright", "language",
+        "show", "season_number", "episode", "network", "rotate", "fps",
+        "resolution", "bit_rate",
+    }
+    profiles = {"baseline", "main", "high", "high10", "high422", "high444"}
+    pixel_formats = {"yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "yuv422p10le", "yuv444p10le", "nv12", "gray"}
+
+    def bounded_number(value: str, low: float, high: float) -> bool:
+        try:
+            return low <= float(value) <= high
+        except (TypeError, ValueError):
             return False
 
+    def valid_value(flag: str, value: str) -> bool:
+        if not value or len(value) > 240 or "\x00" in value:
+            return False
+        if "://" in value or value.startswith(("/", "~", "\\")):
+            return False
+        if flag in {"-preset"}:
+            return value.lower() in {
+                "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+                "slow", "slower", "veryslow",
+            }
+        if flag == "-crf":
+            return bounded_number(value, 0, 63)
+        if flag in {"-qscale:v", "-cpu-used"}:
+            return bounded_number(
+                value,
+                0 if flag == "-cpu-used" else 1,
+                8 if flag == "-cpu-used" else 31,
+            )
+        if flag in {"-b:v", "-b:a"}:
+            match = re.fullmatch(r"(\d{1,7})([kKmM]?)", value)
+            return bool(
+                match
+                and (0 if flag == "-b:v" else 1)
+                <= int(match.group(1))
+                <= 50_000_000
+            )
+        if flag == "-profile:v":
+            return value.lower() in profiles
+        if flag == "-level":
+            return bool(re.fullmatch(r"\d{1,3}(?:\.\d+)?", value))
+        if flag == "-tag:v":
+            return bool(re.fullmatch(r"[A-Za-z0-9]{4}", value))
+        if flag == "-pix_fmt":
+            return value.lower() in pixel_formats
+        if flag in {"-r", "-g", "-keyint_min", "-sc_threshold", "-max_muxing_queue_size", "-threads"}:
+            if flag == "-threads":
+                return bounded_number(value, 1, 8)
+            if flag == "-max_muxing_queue_size":
+                return bounded_number(value, 1, 8192)
+            if flag == "-r":
+                return bounded_number(value, 1, 60)
+            return bounded_number(value, 0 if flag == "-sc_threshold" else 1, 1_000_000)
+        if flag == "-movflags":
+            return bool(re.fullmatch(r"[A-Za-z0-9_+-]{1,100}", value))
+        if flag.startswith("-metadata"):
+            if "=" not in value:
+                return False
+            key, metadata_value = value.split("=", 1)
+            return key.lower() in metadata_keys and len(metadata_value) <= 200 and "\\" not in metadata_value
         return True
-    except Exception:
+
+    try:
+        args = shlex.split(cmd)
+    except ValueError:
         return False
+    if not args or len(args) > 48:
+        return False
+
+    expect_value = False
+    current_flag = ""
+    for arg in args:
+        lowered = arg.lower()
+        if expect_value:
+            if not valid_value(current_flag, arg):
+                return False
+            expect_value = False
+            current_flag = ""
+            continue
+        if lowered not in allowed:
+            return False
+        if lowered in flags_with_values:
+            expect_value = True
+            current_flag = lowered
+
+    return not expect_value
 
 
 def sanitize_custom_name(name: str) -> Optional[str]:
@@ -44,6 +145,15 @@ def sanitize_custom_name(name: str) -> Optional[str]:
     if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
         return name
     return None
+
+
+def _is_safe_asset_path(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath(
+            (os.path.realpath(path), os.path.realpath(root))
+        ) == os.path.realpath(root)
+    except (OSError, ValueError):
+        return False
 
 
 def _write_asset(path: str, data: bytes) -> bool:
@@ -93,10 +203,11 @@ def prepare_thumbnail(user_id: int, settings: Dict) -> Optional[str]:
     if not thumb:
         return None
     if isinstance(thumb, str):
+        if not _is_safe_asset_path(thumb, THUMB_DIR):
+            log.warning("Ignoring thumbnail path outside THUMB_DIR")
+            return None
         return thumb if os.path.exists(thumb) else None
     if isinstance(thumb, bytes):
-        from bot.config import THUMB_DIR
-
         thumb_path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
         if not os.path.exists(thumb_path):
             if not _write_asset(thumb_path, thumb):
@@ -119,19 +230,27 @@ def escape_drawtext(text: str) -> str:
 def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
     """Generates the FFmpeg filter string for watermarks."""
     wm_settings = settings.get("watermark", {})
+    if not isinstance(wm_settings, dict):
+        return ""
     wm_type = wm_settings.get("type", "none")
+
+    def number(key, default, low, high):
+        try:
+            return max(low, min(high, float(wm_settings.get(key, default))))
+        except (TypeError, ValueError):
+            return default
 
     if not wm_settings.get("enabled", False) or wm_type == "none":
         return ""
 
     position = wm_settings.get("position", "top-right")
-    opacity = float(wm_settings.get("opacity", 0.5))
+    opacity = number("opacity", 0.5, 0.1, 1.0)
 
     timing_mode = wm_settings.get("timing_mode", "always")
-    start_time = float(wm_settings.get("start_time", 0))
-    end_time = float(wm_settings.get("end_time", 0))
-    interval_duration = float(wm_settings.get("interval_duration", 5))
-    interval_period = float(wm_settings.get("interval_period", 30))
+    start_time = number("start_time", 0, 0, 86_400)
+    end_time = number("end_time", 0, 0, 86_400)
+    interval_duration = number("interval_duration", 5, 0.1, 86_400)
+    interval_period = number("interval_period", 30, 0.1, 86_400)
 
     enable_expr = ""
     if timing_mode == "range":
@@ -142,10 +261,17 @@ def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
         )
 
     margins = wm_settings.get("margins", {})
-    m_top = margins.get("top", 10)
-    m_bottom = margins.get("bottom", 10)
-    m_left = margins.get("left", 10)
-    m_right = margins.get("right", 10)
+    if not isinstance(margins, dict):
+        margins = {}
+    def margin(side):
+        try:
+            return max(0, min(500, int(margins.get(side, 10))))
+        except (TypeError, ValueError):
+            return 10
+    m_top = margin("top")
+    m_bottom = margin("bottom")
+    m_left = margin("left")
+    m_right = margin("right")
 
     # Overlay expressions: uppercase W/H refer to the main video,
     # lowercase w/h to the overlay itself.
@@ -160,16 +286,24 @@ def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
 
     credit_text = ""
     if for_preview:
+        preview_font = (
+            FONT_PATH.replace("\\", "/")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+        )
         credit_text = (
-            ",drawtext=fontfile='bot/fonts/Roboto-Regular.ttf'"
+            f",drawtext=fontfile='{preview_font}'"
             ":text='Developed by Argon':fontsize=24:fontcolor=black"
             ":x=W-tw-10:y=H-th-10"
         )
 
     if wm_type == "text":
         text = str(wm_settings.get("text", "Argons Encoder"))
-        font_size = int(wm_settings.get("font_size", 24))
-        border_opacity = float(wm_settings.get("border_opacity", 0.5))
+        try:
+            font_size = max(10, min(100, int(wm_settings.get("font_size", 24))))
+        except (TypeError, ValueError):
+            font_size = 24
+        border_opacity = number("border_opacity", 0.5, 0.0, 1.0)
 
         user_id = settings.get("user_id")
         font_path = FONT_PATH
@@ -177,7 +311,7 @@ def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
             custom_font = os.path.join(WATERMARK_DIR, "fonts", f"{user_id}.ttf")
             if os.path.exists(custom_font):
                 font_path = custom_font
-
+        font_path = font_path.replace("\\", "/").replace(":", r"\:")
         safe_text = escape_drawtext(text)
 
         return (
@@ -189,11 +323,15 @@ def generate_watermark_filter(settings: Dict, for_preview: bool = False) -> str:
 
     elif wm_type == "image":
         image_path = wm_settings.get("image_path", "")
-        if not image_path or not os.path.exists(image_path):
+        if (
+            not image_path
+            or not _is_safe_asset_path(str(image_path), WATERMARK_DIR)
+            or not os.path.exists(str(image_path))
+        ):
             log.warning(f"Watermark image missing on disk: {image_path}")
             return ""
 
-        scale = float(wm_settings.get("scale", 0.1))
+        scale = number("scale", 0.1, 0.1, 1.0)
 
         try:
             image_path = os.path.relpath(image_path, os.getcwd())
@@ -259,8 +397,18 @@ def generate_ffmpeg_cmd(
     resolutions = video_settings.get("resolution", ["1080p"])
     if isinstance(resolutions, str):
         resolutions = [resolutions]
+    if not isinstance(resolutions, list):
+        resolutions = ["1080p"]
+    resolutions = list(
+        dict.fromkeys(
+            resolution
+            for resolution in resolutions
+            if resolution in {"1080p", "720p", "480p", "360p"}
+        )
+    ) or ["1080p"]
 
     remux = bool(video_settings.get("remux", False))
+    output_as_video = bool(settings.get("output_as_video", False))
 
     audio_codec = audio_settings.get("codec", "aac")
     if audio_codec not in VALID_AUDIO_CODECS:
@@ -285,15 +433,16 @@ def generate_ffmpeg_cmd(
         res_heights = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
         target_h = res_heights.get(res)
 
-        cmd = ["ffmpeg", "-i", input_file]
+        cmd = [FFMPEG_BIN, "-i", input_file]
 
         if remux:
             # Fast container-fix mode: stream copy everything.
             cmd.extend(["-map", "0", "-c", "copy"])
         else:
-            if thumbnail_path:
-                cmd.extend(["-i", thumbnail_path])
-
+            # The custom image is a Telegram delivery thumbnail, not an input
+            # stream. Keeping it out of the encoded graph avoids MP4's lack of
+            # a broadly compatible attached-PIC video codec and prevents the
+            # normal video codec from overriding the thumbnail stream.
             # Never upscale: cap height at source height via min(ih, TARGET).
             scale_filter = ""
             if target_h:
@@ -319,21 +468,18 @@ def generate_ffmpeg_cmd(
             if not is_complex:
                 cmd.extend(["-map", "0:v?"])
 
-            # Audio track selection
+            # Audio track selection is 1-based in the UI; FFmpeg is 0-based.
             if audio_track in ("none", "off"):
                 pass  # no audio mapping
             elif audio_track.isdigit():
-                cmd.extend(["-map", f"0:a:{audio_track}?"])
+                track_index = max(0, int(audio_track) - 1)
+                cmd.extend(["-map", f"0:a:{track_index}?"])
             else:
                 cmd.extend(["-map", "0:a?"])
 
             # Subtitles
             if subtitle_mode == "copy":
                 cmd.extend(["-map", "0:s?"])
-
-            if thumbnail_path:
-                cmd.extend(["-map", "1", "-c:v:1", "png"])
-                cmd.extend(["-disposition:v:1", "attached_pic"])
 
             if video_filters:
                 if any("movie=" in f for f in video_filters):
@@ -350,7 +496,12 @@ def generate_ffmpeg_cmd(
                     cmd.extend(["-c:a", audio_codec, "-b:a", audio_bitrate])
 
             if subtitle_mode == "copy":
-                cmd.extend(["-c:s", "copy"])
+                # MP4 cannot carry every subtitle codec found in Matroska.
+                # Convert text subtitles to the broadly supported mov_text
+                # representation while preserving the user's copy/drop choice.
+                cmd.extend(
+                    ["-c:s", "mov_text" if output_as_video else "copy"]
+                )
             else:
                 cmd.extend(["-sn"])
 
@@ -394,23 +545,25 @@ def generate_ffmpeg_cmd(
             custom_map = settings.get("custom_ffmpeg", {}) or {}
             custom_args = custom_map.get(active_custom, "")
             if custom_args:
-                try:
+                if not validate_ffmpeg_command(custom_args):
+                    log.warning(
+                        "Ignoring unsafe legacy custom_ffmpeg args for %r",
+                        active_custom,
+                    )
+                else:
                     cmd.extend(shlex.split(custom_args))
-                except ValueError:
-                    log.warning(f"Invalid custom_ffmpeg args for {active_custom!r}")
+
+        # Stop writing before a runaway encode consumes the entire volume.
+        cmd.extend(["-fs", str(MAX_OUTPUT_SIZE)])
 
         # Output path is appended by FFmpegProcess.start() along with -y.
         # Streamable delivery prefers MP4 + faststart for instant playback.
         suffix = f"_{res}" if len(resolutions) > 1 else ""
-        if settings.get("output_as_video"):
+        if output_as_video:
             ext = ".mp4"
             # faststart moves the moov atom to the file head so Telegram can
-            # stream the result immediately after upload.
-            if not remux:
-                cmd.extend(["-movflags", "+faststart"])
-            elif remux:
-                # remux into mp4 also benefits from faststart
-                cmd.extend(["-movflags", "+faststart"])
+            # stream the result immediately after upload, including remuxes.
+            cmd.extend(["-movflags", "+faststart"])
         else:
             ext = ".mkv"
         # Avoid rare "queue full" failures on complex graphs.

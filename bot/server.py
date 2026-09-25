@@ -5,8 +5,12 @@ routes = web.RouteTableDef()
 
 
 @routes.get("/", allow_head=True)
+@routes.get("/healthz", allow_head=True)
 async def root_route_handler(request):
-    return web.json_response({"status": "ok", "bot": "ArgonsEncoder"})
+    return web.json_response(
+        {"status": "ok", "service": "argons-encoder"},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def web_server():

@@ -4,6 +4,7 @@ import time
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery
 
+from bot.decorator import is_banned
 from bot.func.editquery import handle_encoding_callback
 from bot.logger import LOGGER
 
@@ -23,10 +24,13 @@ def _prune_if_needed():
             user_last_interaction.pop(key, None)
 
 
-@Client.on_callback_query(filters.regex(r"^enc_"))
+@Client.on_callback_query(filters.regex(r"^enc_") & filters.private)
 async def encoding_callback_handler(client: Client, callback_query: CallbackQuery):
     """Handler for encoding callbacks with rate limiting."""
     user_id = callback_query.from_user.id
+    if await is_banned(user_id):
+        await callback_query.answer("You are banned from using this bot.", show_alert=True)
+        return
     current_time = time.time()
 
     last = user_last_interaction.get(user_id, 0)

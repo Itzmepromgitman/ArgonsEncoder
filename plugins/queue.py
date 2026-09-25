@@ -1,5 +1,7 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import time
+from html import escape
+from typing import Optional
 
 import psutil
 from pyrogram import Client, filters
@@ -10,11 +12,12 @@ from pyrogram.types import (
     Message,
 )
 
-from bot.config import OWNER_ID
-from bot.decorator import task
+from bot.config import DOWNLOAD_DIR, OWNER_ID
+from bot.decorator import is_banned, task
 from bot.func.editquery import render_queue_text
 from bot.func.encode import active_encodings
 from bot.func.queue_manager import queue_manager
+from bot.func.upload_manager import upload_manager
 from bot.logger import LOGGER
 from bot.utils.ui import ICONS, btn, close_btn, empty_state, refresh_btn, safe_edit, truncate
 
@@ -23,18 +26,30 @@ log = LOGGER(__name__)
 BOT_START_TIME = time.time()
 
 
+def _owns_callback_message(callback_query: CallbackQuery) -> bool:
+    return (
+        getattr(getattr(callback_query, "message", None), "chat", None) is not None
+        and callback_query.message.chat.id == callback_query.from_user.id
+    )
+
+
 def _uptime_text() -> str:
     from bot.utils.format import format_time
 
     return format_time((int(time.time() - BOT_START_TIME) * 1000))
 
 
-def _queue_keyboard(jobs, refresh_cb: str = "queue_view") -> InlineKeyboardMarkup:
+def _queue_keyboard(
+    jobs,
+    refresh_cb: str = "queue_view",
+    back_cb: Optional[str] = None,
+    upload_cancel: bool = False,
+) -> InlineKeyboardMarkup:
     """Numbered cancel buttons with a clear header action row."""
     buttons = []
     if jobs:
         row = []
-        for i, job in enumerate(jobs[:9], 1):
+        for i, job in enumerate(jobs[:20], 1):
             row.append(btn(f"{i} 🚫", f"qcancel_{job.job_id}"))
             if len(row) == 3:
                 buttons.append(row)
@@ -42,11 +57,15 @@ def _queue_keyboard(jobs, refresh_cb: str = "queue_view") -> InlineKeyboardMarku
         if row:
             buttons.append(row)
         buttons.append([refresh_btn(refresh_cb)])
+    if upload_cancel:
+        buttons.append([btn("⏹ Cancel deliveries", "queue_cancel_uploads")])
+    if back_cb:
+        buttons.append([btn(f"{ICONS.back} Back", back_cb)])
     buttons.append([close_btn()])
     return InlineKeyboardMarkup(buttons)
 
 
-@Client.on_message(filters.command("cancel"))
+@Client.on_message(filters.command("cancel") & filters.private)
 @task
 async def cancel_command(client: Client, message: Message):
     try:
@@ -64,7 +83,7 @@ async def cancel_command(client: Client, message: Message):
 
         if not job:
             await message.reply_text(
-                f"❌ No job <code>{job_id}</code> found — it may have already finished."
+                f"❌ No job <code>{escape(str(job_id))}</code> found — it may have already finished."
             )
             return
 
@@ -74,14 +93,20 @@ async def cancel_command(client: Client, message: Message):
 
         if job.status == "running":
             if await _cancel_single_job(job_id):
-                await message.reply_text(f"🚫 Job <code>{job_id}</code> cancelled.")
+                await message.reply_text(
+                    f"🚫 Job <code>{escape(str(job_id))}</code> cancelled."
+                )
             else:
-                await message.reply_text(f"⚠️ Could not cancel job <code>{job_id}</code>.")
+                await message.reply_text(
+                    f"⚠️ Could not cancel job <code>{escape(str(job_id))}</code>."
+                )
         else:
             if await queue_manager.cancel_job(job_id):
                 await message.reply_text(f"🚫 Job <code>{job_id}</code> removed from queue.")
             else:
-                await message.reply_text(f"⚠️ Could not cancel job <code>{job_id}</code>.")
+                await message.reply_text(
+                    f"⚠️ Could not cancel job <code>{escape(str(job_id))}</code>."
+                )
 
     except Exception as e:
         log.error(f"Error in cancel command: {e}")
@@ -92,32 +117,59 @@ def _user_queue_view(user_id: int):
     is_owner = user_id == OWNER_ID
     jobs = queue_manager.get_all_jobs() if is_owner else queue_manager.get_user_jobs(user_id)
     text = render_queue_text(jobs, for_user=user_id)
+    uploads = upload_manager.get_user_jobs(user_id)
+    if uploads:
+        uploading = sum(1 for item in uploads if item.status == "uploading")
+        waiting = len(uploads) - uploading
+        text += (
+            f"\n<blockquote>{ICONS.upload} Delivery: <code>{uploading}</code> uploading · "
+            f"<code>{waiting}</code> waiting</blockquote>"
+        )
     if jobs:
         text += "\n\n<i>Tap 🚫 next to a number to cancel that job.</i>"
     return jobs, text
 
 
-@Client.on_message(filters.command("queue"))
+@Client.on_message(filters.command("queue") & filters.private)
 @task
 async def queue_command(client: Client, message: Message):
     user_id = message.from_user.id
     jobs, text = _user_queue_view(user_id)
-    await message.reply_text(text, reply_markup=_queue_keyboard(jobs))
+    await message.reply_text(
+        text,
+        reply_markup=_queue_keyboard(
+            jobs,
+            upload_cancel=bool(upload_manager.get_user_jobs(user_id)),
+        ),
+    )
 
 
-@Client.on_callback_query(filters.regex(r"^queue_view$"))
+@Client.on_callback_query(filters.regex(r"^queue_view$") & filters.private)
 async def queue_view_refresh(client: Client, callback_query: CallbackQuery):
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
     user_id = callback_query.from_user.id
     jobs, text = _user_queue_view(user_id)
     try:
-        await safe_edit(callback_query.message, text, _queue_keyboard(jobs))
+        await safe_edit(
+            callback_query.message,
+            text,
+            _queue_keyboard(
+                jobs,
+                upload_cancel=bool(upload_manager.get_user_jobs(user_id)),
+            ),
+        )
     except Exception:
         pass
     await callback_query.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^qcancel_"))
+@Client.on_callback_query(filters.regex(r"^qcancel_") & filters.private)
 async def queue_cancel_single(client: Client, callback_query: CallbackQuery):
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
     user_id = callback_query.from_user.id
     job_id = callback_query.data.replace("qcancel_", "", 1)
 
@@ -132,29 +184,42 @@ async def queue_cancel_single(client: Client, callback_query: CallbackQuery):
     ok = await _cancel_single_job(job_id)
     await callback_query.answer("🚫 Cancelled" if ok else "⚠️ Could not cancel")
 
-    # Refresh the view the user is looking at.
-    callback_query.data = "queue_view"
-    await queue_view_refresh(client, callback_query)
+    # Refresh without answering the same callback query a second time.
+    jobs, text = _user_queue_view(user_id)
+    await safe_edit(
+        callback_query.message,
+        text,
+        _queue_keyboard(
+            jobs,
+            upload_cancel=bool(upload_manager.get_user_jobs(user_id)),
+        ),
+    )
 
 
-@Client.on_message(filters.command("status"))
+@Client.on_message(filters.command("status") & filters.private)
 @task
 async def status_command(client: Client, message: Message):
-    text, buttons = _status_card()
+    text, buttons = _status_card(message.from_user.id)
     await message.reply_text(text, reply_markup=buttons)
 
 
-def _status_card():
-    jobs = queue_manager.get_all_jobs()
+def _status_card(user_id: int = OWNER_ID, home_button: bool = False):
+    is_owner = user_id == OWNER_ID
+    jobs = queue_manager.get_all_jobs() if is_owner else queue_manager.get_user_jobs(user_id)
+    uploads = upload_manager.get_all_jobs() if is_owner else upload_manager.get_user_jobs(user_id)
+    uploading = sum(1 for item in uploads if item.status == "uploading")
+    delivery_pending = len(uploads) - uploading
     running = [j for j in jobs if j.status in ("running", "yielded")]
     pending = len(jobs) - len(running)
 
-    # Prime CPU so the first reading is not 0%.
-    psutil.cpu_percent(interval=None)
-    cpu = psutil.cpu_percent(interval=None)
+    cpu = psutil.cpu_percent(interval=0.1)
     ram = psutil.virtual_memory().percent
-    disk = psutil.disk_usage(".").percent
-    free_gb = psutil.disk_usage(".").free / (1024 ** 3)
+    try:
+        disk_usage = psutil.disk_usage(DOWNLOAD_DIR)
+    except (FileNotFoundError, OSError):
+        disk_usage = psutil.disk_usage(".")
+    disk = disk_usage.percent
+    free_gb = disk_usage.free / (1024 ** 3)
 
     running_lines = ""
     for job in running[:5]:
@@ -162,7 +227,9 @@ def _status_card():
         pct = f"{proc.stats.percent:.0f}%" if proc else "?"
         name = job.file_name if job.file_name != "Unknown" else job.job_id
         icon = ICONS.pause if job.status == "yielded" else ICONS.encode
-        running_lines += f"{icon} <code>{truncate(name, 28)}</code> · {pct}\n"
+        running_lines += (
+            f"{icon} <code>{escape(truncate(name, 28))}</code> · {pct}\n"
+        )
 
     load_block = (
         f"🖥 CPU <code>{cpu}%</code> · RAM <code>{ram}%</code>\n"
@@ -170,28 +237,29 @@ def _status_card():
     )
 
     text = (
-        f"{ICONS.status} <b>Live status</b>\n"
+        f"{ICONS.status} <b>{'Fleet' if is_owner else 'Your'} live status</b>\n"
         f"<blockquote>🎬 Encoding: <code>{len(running)}</code> · ⏳ Queued: <code>{pending}</code>\n"
+        f"📤 Uploading: <code>{uploading}</code> · Delivery wait: <code>{delivery_pending}</code>\n"
         f"⏱ Uptime: <code>{_uptime_text()}</code></blockquote>"
     )
     if running_lines:
         text += f"\n<blockquote>{running_lines.rstrip()}</blockquote>"
     text += f"\n<blockquote>{load_block}</blockquote>"
 
-    buttons = InlineKeyboardMarkup(
-        [
-            [
-                refresh_btn("st_refresh"),
-                close_btn(),
-            ]
-        ]
-    )
+    status_buttons = [refresh_btn("st_refresh")]
+    if home_button:
+        status_buttons.append(btn(f"{ICONS.home} Home", "cb_start"))
+    status_buttons.append(close_btn())
+    buttons = InlineKeyboardMarkup([status_buttons])
     return text, buttons
 
 
-@Client.on_callback_query(filters.regex(r"^st_refresh$"))
+@Client.on_callback_query(filters.regex(r"^st_refresh$") & filters.private)
 async def status_refresh(client: Client, callback_query: CallbackQuery):
-    text, buttons = _status_card()
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
+    text, buttons = _status_card(callback_query.from_user.id)
     try:
         await safe_edit(callback_query.message, text, buttons)
     except Exception:
@@ -199,14 +267,19 @@ async def status_refresh(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
 
 
-def _jobs_dashboard(jobs):
+def _jobs_dashboard(jobs, page: int = 0):
     lines = []
     row = []
     buttons = []
-    for i, job in enumerate(jobs[:15], 1):
+    page_size = 15
+    pages = max(1, (len(jobs) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    visible = jobs[page * page_size : (page + 1) * page_size]
+    for i, job in enumerate(visible, page * page_size + 1):
         icon = {"running": ICONS.encode, "yielded": ICONS.pause, "pending": "⏳"}.get(job.status, "•")
         lines.append(
-            f"{i}️⃣ {icon} <code>{truncate(job.file_name, 24)}</code> · 👤 <code>{job.user_id}</code>"
+            f"{i}️⃣ {icon} <code>{escape(truncate(job.file_name, 24))}</code> · "
+            f"👤 <code>{job.user_id}</code> · ID <code>{job.job_id}</code>"
         )
         row.append(btn(f"{i} ❌", f"qj_{job.job_id}"))
         if len(row) == 3:
@@ -214,6 +287,14 @@ def _jobs_dashboard(jobs):
             row = []
     if row:
         buttons.append(row)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️ Previous", f"jobs_view_page_{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", f"jobs_view_page_{page}"))
+        if page + 1 < pages:
+            nav.append(btn("Next ➡️", f"jobs_view_page_{page + 1}"))
+        buttons.append(nav)
     buttons.append([refresh_btn("jobs_view")])
     buttons.append([close_btn()])
 
@@ -221,12 +302,14 @@ def _jobs_dashboard(jobs):
     text = (
         f"{ICONS.jobs} <b>All jobs</b> · <code>{len(jobs)}</code>\n"
         f"<blockquote>{body}</blockquote>\n"
-        f"<i>Tap a number to cancel that job.</i>"
+        f"<i>Page {page + 1}/{pages} · Tap a number to cancel that job.</i>"
     )
     return text, InlineKeyboardMarkup(buttons)
 
 
-@Client.on_message(filters.command("jobs") & filters.user(OWNER_ID))
+@Client.on_message(
+    filters.command("jobs") & filters.user(OWNER_ID) & filters.private
+)
 async def jobs_command(client: Client, message: Message):
     """Owner-only fleet-wide job dashboard with per-job cancel buttons."""
     jobs = queue_manager.get_all_jobs()
@@ -240,12 +323,21 @@ async def jobs_command(client: Client, message: Message):
     await message.reply_text(text, reply_markup=buttons)
 
 
-@Client.on_callback_query(filters.regex(r"^jobs_view$"))
+@Client.on_callback_query(
+    filters.regex(r"^jobs_view(?:_page_\d+)?$") & filters.private
+)
 async def jobs_view_refresh(client: Client, callback_query: CallbackQuery):
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
     if callback_query.from_user.id != OWNER_ID:
         await callback_query.answer("Owner only.", show_alert=True)
         return
     jobs = queue_manager.get_all_jobs()
+    try:
+        page = int(callback_query.data.split("_page_")[-1])
+    except (TypeError, ValueError):
+        page = 0
     if not jobs:
         try:
             await safe_edit(
@@ -257,7 +349,7 @@ async def jobs_view_refresh(client: Client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
-    text, buttons = _jobs_dashboard(jobs)
+    text, buttons = _jobs_dashboard(jobs, page=page)
     try:
         await safe_edit(callback_query.message, text, buttons)
     except Exception:
@@ -265,8 +357,11 @@ async def jobs_view_refresh(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^qj_"))
+@Client.on_callback_query(filters.regex(r"^qj_") & filters.private)
 async def qj_cancel(client: Client, callback_query: CallbackQuery):
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
     if callback_query.from_user.id != OWNER_ID:
         await callback_query.answer("Owner only.", show_alert=True)
         return
@@ -274,11 +369,18 @@ async def qj_cancel(client: Client, callback_query: CallbackQuery):
     job_id = callback_query.data.replace("qj_", "", 1)
     ok = await _cancel_single_job(job_id)
     await callback_query.answer("🚫 Cancelled" if ok else "⚠️ Not cancellable")
-    callback_query.data = "jobs_view"
-    await jobs_view_refresh(client, callback_query)
+    jobs = queue_manager.get_all_jobs()
+    if jobs:
+        text, buttons = _jobs_dashboard(jobs)
+    else:
+        text = empty_state("No active jobs", "Queue and workers are idle.")
+        buttons = InlineKeyboardMarkup([[close_btn()]])
+    await safe_edit(callback_query.message, text, buttons)
 
 
-@Client.on_message(filters.command("info") & filters.user(OWNER_ID))
+@Client.on_message(
+    filters.command("info") & filters.user(OWNER_ID) & filters.private
+)
 async def info_command(client: Client, message: Message):
     try:
         args = message.command
@@ -313,7 +415,7 @@ async def info_command(client: Client, message: Message):
 
         text = (
             f"{ICONS.info} <b>Job information</b>\n\n"
-            f"<blockquote>🆔 <b>ID:</b> <code>{job.job_id}</code>\n"
+            f"<blockquote>🆔 <b>ID:</b> <code>{escape(str(job.job_id))}</code>\n"
             f"📊 <b>Status:</b> {status}</blockquote>\n\n"
             f"<blockquote>👤 <b>User</b>\n"
             f"├ Name: {user_text}\n"
@@ -336,7 +438,7 @@ def escape_filename(name: str) -> str:
     return escape(str(name or ""))
 
 
-@Client.on_message(filters.command("clear"))
+@Client.on_message(filters.command("clear") & filters.private)
 @task
 async def clear_command(client: Client, message: Message):
     user_id = message.from_user.id
@@ -383,7 +485,9 @@ async def clear_command(client: Client, message: Message):
             )
 
 
-@Client.on_message(filters.command("cancelall") & filters.user(OWNER_ID))
+@Client.on_message(
+    filters.command("cancelall") & filters.user(OWNER_ID) & filters.private
+)
 async def cancel_all_command(client: Client, message: Message):
     count = len(queue_manager.get_all_jobs())
     await message.reply_text(
@@ -401,15 +505,33 @@ async def cancel_all_command(client: Client, message: Message):
     )
 
 
-@Client.on_callback_query(filters.regex(r"^queue_(clear_mine|confirm_all|cancel)$"))
+@Client.on_callback_query(
+    filters.regex(r"^queue_(clear_mine|confirm_all|cancel|cancel_uploads)$") & filters.private
+)
 async def queue_callback_handler(client: Client, callback_query: CallbackQuery):
+    if not _owns_callback_message(callback_query):
+        await callback_query.answer("This panel belongs to another chat.", show_alert=True)
+        return
     action = callback_query.data
     user_id = callback_query.from_user.id
+    if await is_banned(user_id):
+        await callback_query.answer("You are banned from using this bot.", show_alert=True)
+        return
 
-    # Auth: clear_mine is allowed for the requesting user; confirm_all is owner-only.
-    if action in ("queue_clear_mine",) and user_id != callback_query.message.chat.id:
-        # Non-owner may only clear their own jobs via their own confirmation.
-        pass
+    # clear_mine always acts on the requesting user's own jobs. Fleet-wide
+    # cancellation is restricted to the owner.
+    if action == "queue_cancel_uploads":
+        count = await upload_manager.cancel_user_jobs(user_id)
+        try:
+            await safe_edit(
+                callback_query.message,
+                f"⏹ Cancelled {count} pending delivery job(s).",
+            )
+        except Exception:
+            pass
+        await callback_query.answer()
+        return
+
     if action == "queue_confirm_all" and user_id != OWNER_ID:
         await callback_query.answer("❌ Owner only.", show_alert=True)
         return
@@ -454,13 +576,11 @@ async def _cancel_user_jobs(user_id: int) -> int:
 
 
 async def _cancel_all_jobs() -> int:
-    count = len(queue_manager.get_all_jobs())
-
-    # cancel_job uniformly handles running (proc kill), yielded (proc kill +
-    # file cleanup) and pending (file cleanup) jobs.
+    count = 0
     for job in queue_manager.get_all_jobs():
         try:
-            await queue_manager.cancel_job(job.job_id)
+            if await queue_manager.cancel_job(job.job_id):
+                count += 1
         except Exception as e:
             log.error(f"Cancel failed for {job.job_id}: {e}")
 

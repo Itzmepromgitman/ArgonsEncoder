@@ -1,5 +1,6 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import os
+import shutil
 import time
 import uuid
 from html import escape
@@ -8,10 +9,23 @@ from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from bot.config import DOWNLOAD_DIR, MAX_FILE_SIZE
+from bot.config import (
+    DOWNLOAD_DIR,
+    LOG_DELIVERIES,
+    MAX_FILE_SIZE,
+    MAX_MEDIA_DURATION,
+    MAX_JOBS_PER_USER,
+    MAX_OUTPUT_SIZE,
+    MAX_OUTPUT_VARIANTS,
+    MIN_FREE_DISK_BYTES,
+    MIN_OUTPUT_RESERVATION_BYTES,
+)
+from bot.func.queue_manager import queue_manager
+from bot.func.upload_manager import upload_manager
 from bot.decorator import is_admin, is_banned
 from bot.func.encode import encode, safe_download_media, sanitize_filename
 from bot.logger import LOGGER
+from bot.utils.format import humanbytes
 
 log = LOGGER(__name__)
 
@@ -77,7 +91,14 @@ async def enhanced_document_handler(client: Client, message: Message):
         await message.reply_text("🚫 <b>You are banned from using this bot.</b>")
         return
 
-    from database import get_variable
+    from database import get_variable, is_user_tombstoned
+
+    if await is_user_tombstoned(user_id):
+        await message.reply_text(
+            "🗑 <b>Your bot data was deleted.</b>\n"
+            "<i>Send /start to create a fresh profile.</i>"
+        )
+        return
 
     if await get_variable("maintenance", False) and not await is_admin(user_id):
         await message.reply_text(
@@ -87,26 +108,23 @@ async def enhanced_document_handler(client: Client, message: Message):
         )
         return
 
-    log.info(f"Processing document/video from user {user_id}")
-
-    # Log to Channel
-    try:
-        from bot.config import LOG_CHANNEL
-
-        user = message.from_user
-        doc = message.document or message.video
-        user_link = f"<a href='tg://user?id={user_id}'>{escape(user.first_name)}</a>"
-        await client.send_message(
-            LOG_CHANNEL,
-            f"📥 <b>File Received</b>\n\n"
-            f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
-            f"📄 <b>File:</b> <code>{escape(getattr(doc, 'file_name', 'Unknown') or 'Unknown')}</code>",
+    active_jobs = len(queue_manager.get_user_jobs(user_id)) + len(
+        upload_manager.get_user_jobs(user_id)
+    )
+    if active_jobs >= MAX_JOBS_PER_USER:
+        await message.reply_text(
+            f"⚠️ <b>Your queue is full</b>\n"
+            f"<blockquote>{active_jobs} active job(s) · limit {MAX_JOBS_PER_USER}</blockquote>\n"
+            "<i>Wait for a job to finish or use /queue to cancel one.</i>"
         )
-    except Exception as e:
-        log.error(f"Failed to send log to channel: {e}")
+        return
+
+    log.info("Processing a private document/video intake")
 
     download_file_path = None
     download_msg = None
+    reservation_bytes = 0
+    reservation_active = False
 
     try:
         video_info = await check_and_process_video_document(message)
@@ -119,30 +137,36 @@ async def enhanced_document_handler(client: Client, message: Message):
 
         fi = video_info["file_info"]
         if not video_info["is_encodable"]:
-            size_mb = (fi["file_size"] or 0) / (1024 * 1024)
-            limit_gb = MAX_FILE_SIZE // (1024 * 1024 * 1024)
+            size_display = humanbytes(fi["file_size"])
             if fi["file_size"] and fi["file_size"] > MAX_FILE_SIZE:
                 await message.reply_text(
                     f"⚠️ <b>File too large</b>\n"
                     f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
-                    f"📦 {size_mb:.2f} MB · limit {limit_gb} GB</blockquote>\n"
+                    f"📦 {humanbytes(fi['file_size'])} · limit {humanbytes(MAX_FILE_SIZE)}</blockquote>\n"
                     f"<i>Split the file or lower the resolution source, then retry.</i>"
                 )
             else:
                 await message.reply_text(
                     f"⚠️ <b>Can't encode this file</b>\n"
                     f"<blockquote>📁 <code>{escape(fi['file_name'])}</code>\n"
-                    f"📦 {size_mb:.2f} MB · "
+                    f"📦 {size_display} · "
                     f"🏷️ {escape(fi['mime_type']) or 'unknown type'}</blockquote>\n"
                     f"<i>Unsupported format. Supported: MP4, MKV, AVI, MOV, WebM and similar.</i>"
                 )
+            return
+
+        if fi.get("duration", 0) and float(fi["duration"]) > MAX_MEDIA_DURATION:
+            await message.reply_text(
+                "⚠️ <b>Video is too long</b>\n"
+                f"<i>The limit is {MAX_MEDIA_DURATION // 3600} hours.</i>"
+            )
             return
 
         if not video_info["encoding_ready"]:
             if fi["file_size"] and fi["file_size"] > MAX_FILE_SIZE:
                 await message.reply_text(
                     f"⚠️ <b>File too large</b>\n"
-                    f"<i>Over the {MAX_FILE_SIZE // (1024 * 1024 * 1024)} GB limit.</i>"
+                    f"<i>Over the {humanbytes(MAX_FILE_SIZE)} limit.</i>"
                 )
             else:
                 await message.reply_text(
@@ -151,8 +175,68 @@ async def enhanced_document_handler(client: Client, message: Message):
                 )
             return
 
+        file_identity = str(fi.get("file_id", "") or "")
+        source_id = file_identity or f"{user_id}:{message.chat.id}:{message.id}"
+        if queue_manager.has_source(user_id, source_id):
+            await message.reply_text(
+                "ℹ️ <b>This file is already in your queue.</b>\n"
+                "<i>Use /queue to track or cancel it.</i>"
+            )
+            return
+
+        if not queue_manager.can_accept_job(user_id):
+            await message.reply_text(
+                "⏳ <b>The queue is full</b>\n"
+                "<i>Wait for a slot or cancel an existing job from /queue.</i>"
+            )
+            return
+
+        Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+        free_disk = shutil.disk_usage(DOWNLOAD_DIR).free
+        if free_disk < MIN_FREE_DISK_BYTES:
+            await message.reply_text(
+                "⚠️ <b>Server storage is temporarily low</b>\n"
+                "<i>Please try again after the operator frees disk space.</i>"
+            )
+            return
+        source_size = max(1, int(fi["file_size"]))
+        duration = float(fi.get("duration", 0) or 0)
+        if duration > 0:
+            # 50 Mbps is the current custom-override ceiling; add container
+            # overhead and cap each variant at the configured output limit.
+            per_variant = int(duration * 50_000_000 / 8) + MIN_OUTPUT_RESERVATION_BYTES
+        else:
+            per_variant = max(MIN_OUTPUT_RESERVATION_BYTES, source_size * 3)
+        per_variant = min(MAX_OUTPUT_SIZE, per_variant)
+        reservation_variants = max(MAX_OUTPUT_VARIANTS, 4)
+        reservation_bytes = source_size + per_variant * reservation_variants
+        if not await queue_manager.reserve_disk(reservation_bytes):
+            await message.reply_text(
+                "⚠️ <b>Server storage is reserved for active jobs</b>\n"
+                "<i>Please try again when a slot frees up.</i>"
+            )
+            return
+        reservation_active = True
+
+        # Log only accepted media when the operator explicitly opts in.
+        if LOG_DELIVERIES:
+            try:
+                from bot.config import LOG_CHANNEL
+
+                user = message.from_user
+                user_link = f"<a href='tg://user?id={user_id}'>{escape(user.first_name)}</a>"
+                await client.send_message(
+                    LOG_CHANNEL,
+                    f"📥 <b>File accepted</b>\n\n"
+                    f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
+                    f"📄 <b>File:</b> <code>{escape(fi['file_name'])}</code>\n"
+                    f"📦 <b>Size:</b> <code>{humanbytes(fi['file_size'])}</code>",
+                )
+            except Exception as exc:
+                log.error(f"Failed to send intake log: {exc}")
+
         downloads_dir = Path(DOWNLOAD_DIR)
-        downloads_dir.mkdir(exist_ok=True)
+        downloads_dir.mkdir(parents=True, exist_ok=True)
 
         safe_filename = sanitize_filename(fi["file_name"])
         download_file_path = (
@@ -189,21 +273,31 @@ async def enhanced_document_handler(client: Client, message: Message):
             message=download_msg,
             chat_id=message.chat.id,
             message_id=message.id,
+            source_file_name=fi["file_name"],
+            source_id=source_id,
+            reserved_bytes=reservation_bytes,
         )
+        reservation_active = False
 
-    except Exception as e:
-        log.error(f"Unexpected error in document handler for user {user_id}: {e}")
-        detail = escape(str(e))[:300]
+    except Exception as exc:
+        log.error(
+            f"Unexpected document-handler error for user {user_id}: {exc}",
+            exc_info=True,
+        )
         if download_msg:
             try:
                 await download_msg.edit(
-                    f"❌ <b>Something went wrong</b>\n<blockquote>{detail}</blockquote>"
+                    "❌ <b>Could not start this job</b>\n"
+                    "<blockquote>No upload was started. Please wait a moment and try again.</blockquote>"
                 )
             except Exception:
                 pass
         else:
             try:
-                await message.reply_text(f"❌ <b>Something went wrong</b>\n<blockquote>{detail}</blockquote>")
+                await message.reply_text(
+                    "❌ <b>Could not start this job</b>\n"
+                    "<blockquote>Please wait a moment and try again.</blockquote>"
+                )
             except Exception:
                 pass
 
@@ -213,3 +307,6 @@ async def enhanced_document_handler(client: Client, message: Message):
                 log.info(f"Cleaned up file after error: {download_file_path}")
             except Exception as cleanup_error:
                 log.error(f"Failed to cleanup file {download_file_path}: {cleanup_error}")
+    finally:
+        if reservation_active:
+            await queue_manager.release_disk(reservation_bytes)

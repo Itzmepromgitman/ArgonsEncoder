@@ -33,6 +33,7 @@ def test_from_dict_roundtrip():
         message_id=7,
         task_type="encode",
         input_file="/dl/a.mkv",
+        source_id="telegram-file-id",
     )
     d = job.to_dict()
     d["status"] = "pending"  # restart normalization
@@ -41,6 +42,7 @@ def test_from_dict_roundtrip():
     assert j2.user_id == 42
     assert j2.task_type == "encode"
     assert j2.file_name == "a.mkv"
+    assert j2.source_id == "telegram-file-id"
     assert j2.func is None  # re-attached later
 
 

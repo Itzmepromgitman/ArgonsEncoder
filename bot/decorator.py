@@ -1,15 +1,16 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import time
+from html import escape
 
 from pyrogram import Client
 
-from .config import LOG_CHANNEL, OWNER_ID
+from .config import ERROR_LOGS_TO_TELEGRAM, LOG_CHANNEL, OWNER_ID
 from .logger import LOGGER
 
 log = LOGGER("decorator")
 
 # Simple TTL caches so we do not hit MongoDB on every update.
-_ban_cache = {"ids": set(), "fetched_at": 0.0}
+_ban_cache = {"ids": set(), "fetched_at": 0.0, "failed": False}
 _admin_cache = {"ids": set(), "fetched_at": 0.0}
 CACHE_TTL = 60.0
 
@@ -18,10 +19,12 @@ async def get_banned_users() -> set:
     now = time.time()
     if now - _ban_cache["fetched_at"] > CACHE_TTL:
         try:
-            from database import get_variable
+            from database import get_variable_strict
 
-            _ban_cache["ids"] = set(await get_variable("banned_users", []))
+            _ban_cache["ids"] = set(await get_variable_strict("banned_users", []))
+            _ban_cache["failed"] = False
         except Exception as e:
+            _ban_cache["failed"] = True
             log.error(f"Failed to load banned users: {e}")
         _ban_cache["fetched_at"] = now
     return _ban_cache["ids"]
@@ -31,9 +34,9 @@ async def get_admins() -> set:
     now = time.time()
     if now - _admin_cache["fetched_at"] > CACHE_TTL:
         try:
-            from database import get_variable
+            from database import get_variable_strict
 
-            _admin_cache["ids"] = set(await get_variable("admin", []))
+            _admin_cache["ids"] = set(await get_variable_strict("admin", []))
         except Exception as e:
             log.error(f"Failed to load admins: {e}")
         _admin_cache["fetched_at"] = now
@@ -42,6 +45,7 @@ async def get_admins() -> set:
 
 def invalidate_user_caches():
     _ban_cache["fetched_at"] = 0.0
+    _ban_cache["failed"] = False
     _admin_cache["fetched_at"] = 0.0
 
 
@@ -49,6 +53,8 @@ async def is_banned(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return False
     banned = await get_banned_users()
+    if _ban_cache.get("failed"):
+        return True
     return user_id in banned
 
 
@@ -92,12 +98,16 @@ def task(func):
                         )
                     except Exception:
                         pass
-                try:
-                    await client.send_message(
-                        chat_id=LOG_CHANNEL,
-                        text=f"Error in '{func.__name__}': <code>{e}</code>",
-                    )
-                except Exception as ex:
-                    logger.error(f"Failed to send error log to LOG_CHANNEL: {ex}")
+                if ERROR_LOGS_TO_TELEGRAM:
+                    try:
+                        await client.send_message(
+                            chat_id=LOG_CHANNEL,
+                            text=(
+                                f"Error in '{escape(func.__name__)}': "
+                                f"<code>{escape(str(e))[:1000]}</code>"
+                            ),
+                        )
+                    except Exception as ex:
+                        logger.error(f"Failed to send error log to LOG_CHANNEL: {ex}")
 
     return wrapper

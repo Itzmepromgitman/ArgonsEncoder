@@ -1,5 +1,6 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import io
+from html import escape
 
 from bot.config import OWNER_ID
 
@@ -46,4 +47,7 @@ async def shell_command(client, message):
         return await message.reply("Nothing to execute.")
 
     response = await run_python_code(code)
-    await message.reply(f"<b>Output:</b>\n<code>{response[:3500]}</code>", quote=True)
+    await message.reply(
+        f"<b>Output:</b>\n<code>{escape(str(response)[:3500])}</code>",
+        quote=True,
+    )

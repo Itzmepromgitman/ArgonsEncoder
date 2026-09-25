@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+logs
+downloads
+watermarks
+thumbs
+.privacy-markers
+.argons-privacy
+*.session
+*.session-journal

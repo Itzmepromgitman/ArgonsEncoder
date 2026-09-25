@@ -405,8 +405,12 @@ def main():
             print("❌ Current directory does not exist")
             sys.exit(1)
 
-        auto_fix_code()
-        fix_fstrings_without_placeholders(".")
+        if "--fix" in sys.argv:
+            print("⚠️ --fix enables in-place formatting; use only on a clean worktree.")
+            auto_fix_code()
+            fix_fstrings_without_placeholders(".")
+        else:
+            print("🔎 Read-only scan (pass --fix to enable in-place changes).")
         scan_repo(".")
 
     except KeyboardInterrupt:

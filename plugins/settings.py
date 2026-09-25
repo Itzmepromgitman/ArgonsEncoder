@@ -1,8 +1,9 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import asyncio
-import copy
 import os
+import uuid
 from html import escape
+from string import Formatter
 
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,44 +13,75 @@ try:
 except ImportError:
     from asyncio import TimeoutError as ListenerTimeout
 
-from bot.decorator import task
+from bot.config import THUMB_DIR, WATERMARK_DIR
+from bot.decorator import is_banned, task
+from bot.func.media import prepare_telegram_thumbnail
 from bot.func.ffmpeg_utils import (
     VALID_AUDIO_CODECS,
     VALID_CODECS,
     VALID_PRESETS,
+    _is_safe_asset_path,
     sanitize_custom_name,
     validate_ffmpeg_command,
 )
 from bot.logger import LOGGER
-from bot.utils.ui import ICONS, back_btn, btn, close_btn, safe_edit, truncate  # noqa: F401
-from database import get_user_settings, update_user_settings
+from bot.utils.listener import ListenerBusy, cancel_session, listen_once
+from bot.utils.settings import (
+    QUALITY_PRESETS,
+    apply_quality_preset,
+    normalize_settings,
+)
+from bot.utils.ui import (
+    ICONS,
+    back_btn,
+    btn,
+    close_btn,
+    safe_edit,
+    state_label,
+    truncate,  # noqa: F401
+)
+from database import get_user_settings, is_user_tombstoned, update_user_settings
 
 log = LOGGER(__name__)
 
-# Default Settings
-DEFAULT_SETTINGS = {
-    "video": {
-        "crf": "23",
-        "preset": "medium",
-        "resolution": ["1080p"],
-        "codec": "libx264",
-        "subtitle_mode": "copy",   # copy | drop
-        "sample_seconds": 0,       # 0 = off; else first N seconds only
-        "remux": False,            # stream-copy container fix mode
-        "trim_start": 0,
-        "trim_end": 0,
-    },
-    "audio": {"bitrate": "128k", "codec": "aac", "track": "all"},
-    "metadata": {
-        "global": {"title": "Encoded by Argons", "author": "Argons Encoder"},
-        "video": {},
-        "audio": {},
-        "subtitle": {},
-    },
-    "custom_ffmpeg": {},
-    "rename": {"pattern": ""},
-    "output_as_video": False,
-}
+
+def _owns_callback_message(callback_query) -> bool:
+    return (
+        getattr(getattr(callback_query, "message", None), "chat", None) is not None
+        and callback_query.message.chat.id == callback_query.from_user.id
+    )
+
+
+async def _safe_callback_answer(callback_query, text=None, show_alert=False):
+    """Answer immediately when possible; late listener replies must not crash."""
+    try:
+        await callback_query.answer(text, show_alert=show_alert)
+    except Exception as exc:
+        log.debug(f"Callback answer was no longer available: {exc}")
+
+
+async def _edit_panel(message, text, reply_markup=None):
+    """Edit text or caption panels consistently, including photo welcome cards."""
+    if any(
+        getattr(message, attribute, None)
+        for attribute in ("photo", "video", "document", "audio", "animation")
+    ):
+        try:
+            return await message.edit_caption(
+                caption=text, reply_markup=reply_markup
+            )
+        except Exception:
+            pass
+    edited = await safe_edit(message, text, reply_markup)
+    if edited:
+        return edited
+    if any(
+        getattr(message, attribute, None)
+        for attribute in ("video", "document", "audio", "animation")
+    ):
+        return await message.reply_text(text=text, reply_markup=reply_markup)
+    return False
+
 
 METADATA_KEYS = {
     "global": [
@@ -77,205 +109,304 @@ METADATA_KEYS = {
 }
 
 
-@Client.on_message(filters.command(["settings", "u_setting"]))
+def _valid_rename_pattern(value: str) -> bool:
+    allowed = {"original", "res", "codec", "date"}
+    try:
+        for _, field_name, format_spec, conversion in Formatter().parse(value):
+            if field_name is not None and field_name not in allowed:
+                return False
+            # Format specs can request enormous expansions (for example
+            # ``*>999999999``) before the later filename truncation runs.
+            # Keep rename templates intentionally simple and bounded.
+            if format_spec:
+                return False
+            if conversion not in (None, "s", "r", "a"):
+                return False
+        return True
+    except ValueError:
+        return False
+
+
+@Client.on_message(filters.command(["settings", "u_setting"]) & filters.private)
 @task
 async def settings_command(client, message, query=False, user_id=None):
-    await render_settings_menu(client, message, query=query, user_id=user_id or message.from_user.id)
+    target_user_id = user_id or message.from_user.id
+    if await is_user_tombstoned(target_user_id):
+        await message.reply_text("🗑 <b>Your bot data was deleted.</b>\n<i>Send /start to begin again.</i>")
+        return
+    await render_settings_menu(client, message, query=query, user_id=target_user_id)
 
 
 async def render_settings_menu(client, message, query: bool = False, user_id: int = None):
     """Shared entry point for /settings and the cb_open_settings button."""
     if user_id is None:
-        # Fallback for legacy callers: private chat id == user id.
         user_id = message.chat.id
+    if await is_user_tombstoned(user_id):
+        return
 
-    settings = await get_user_settings(user_id)
+    settings = normalize_settings(await get_user_settings(user_id))
+    video = settings["video"]
+    audio = settings["audio"]
+    resolutions = ", ".join(video["resolution"])
+    profile = QUALITY_PRESETS.get(settings["profile"])
+    profile_label = profile["label"] if profile else "🎛 Custom"
+    output_label = "Video" if settings["output_as_video"] else "Document"
+    sample = int(video["sample_seconds"])
+    sample_label = f"{sample}s sample" if sample else "Full video"
+    trim_start = float(video["trim_start"])
+    trim_end = float(video["trim_end"])
+    trim_label = (
+        f"{trim_start:g}s → {trim_end:g}s"
+        if trim_end > trim_start
+        else "Off"
+    )
 
-    # Merge with defaults if missing (deepcopy — never share the module dict)
-    if not settings:
-        settings = copy.deepcopy(DEFAULT_SETTINGS)
-        await update_user_settings(user_id, settings)
-
-    # Ensure resolution is a list (migration)
-    if "video" in settings and isinstance(settings["video"].get("resolution"), str):
-        settings["video"]["resolution"] = [settings["video"]["resolution"]]
-        await update_user_settings(user_id, settings)
-
-    res_display = ", ".join(settings.get("video", {}).get("resolution", ["1080p"]))
-    v = settings.get("video", {})
-    a = settings.get("audio", {})
-
-    remux_chip = "⚡ Remux" if v.get("remux") else "🎞 Re-encode"
-    sample = int(v.get("sample_seconds", 0) or 0)
-    sample_chip = f"⏱ Sample {sample}s" if sample else "🎞 Full"
-    sub_mode = v.get("subtitle_mode", "copy")
-    out_chip = "📤 As video" if settings.get("output_as_video") else "📄 As document"
+    watermark = settings["watermark"]
+    watermark_label = (
+        f"{watermark['type'].title()} on" if watermark["enabled"] else "Off"
+    )
+    thumb = settings.get("thumbnail")
+    thumbnail_ready = bool(thumb) and (
+        isinstance(thumb, bytes)
+        or (
+            isinstance(thumb, str)
+            and _is_safe_asset_path(thumb, THUMB_DIR)
+            and os.path.isfile(thumb)
+        )
+    )
+    thumbnail_label = "Set" if thumbnail_ready else "Not set"
+    custom_active = settings.get("active_custom_ffmpeg") or "None"
 
     text = (
-        f"{ICONS.settings} <b>Your encoding settings</b>\n\n"
-        f"<blockquote>🎬 <code>{escape(str(v.get('codec', 'libx264')))}</code> · "
-        f"CRF <code>{escape(str(v.get('crf', '23')))}</code> · "
-        f"<code>{escape(str(v.get('preset', 'medium')))}</code>\n"
-        f"📐 {escape(res_display)} · {remux_chip} · {sample_chip}\n"
-        f"🎵 {escape(str(a.get('codec', 'aac')))} {escape(str(a.get('bitrate', '128k')))} · "
-        f"track {escape(str(a.get('track', 'all')))}\n"
-        f"💬 Subs: {escape(str(sub_mode))} · {out_chip}\n"
-        f"📝 Title: <code>{escape(str(settings.get('metadata', {}).get('global', {}).get('title', 'N/A')))}</code></blockquote>\n"
-        f"<i>Taps save instantly — no need to type /settings again.</i>"
+        f"{ICONS.settings} <b>Encoding settings</b>\n\n"
+        f"<blockquote>{profile_label} · {escape(video['codec'])} · "
+        f"CRF <code>{escape(video['crf'])}</code> · {escape(video['preset'])}\n"
+        f"📐 {escape(resolutions)} · {escape(sample_label)} · "
+        f"{'⚡ Remux' if video['remux'] else '🎞 Re-encode'}</blockquote>\n"
+        f"<blockquote>{ICONS.audio} {escape(audio['codec'])} {escape(audio['bitrate'])} · "
+        f"track {escape(audio['track'])}\n"
+        f"💬 Subtitles: {escape(video['subtitle_mode'])} · "
+        f"{'📤' if settings['output_as_video'] else ICONS.document} {output_label}</blockquote>\n"
+        f"<blockquote>{ICONS.watermark} {watermark_label} · "
+        f"{ICONS.thumb} {thumbnail_label} · ✂️ {trim_label}\n"
+        f"🛠 Custom override: <code>{escape(custom_active)}</code></blockquote>\n"
+        f"<i>Changes save instantly. Presets only alter encoding quality.</i>"
     )
 
     buttons = InlineKeyboardMarkup(
         [
+            [btn(f"{ICONS.video} Video", "set_video"), btn(f"{ICONS.audio} Audio", "set_audio")],
             [
-                InlineKeyboardButton(f"{ICONS.video} Video", callback_data="set_video"),
-                InlineKeyboardButton(f"{ICONS.audio} Audio", callback_data="set_audio"),
+                btn(f"{ICONS.watermark} Watermark", "set_watermark"),
+                btn(f"{ICONS.thumb} Thumbnail", "set_thumbnail"),
             ],
-            [
-                InlineKeyboardButton(f"{ICONS.metadata} Metadata", callback_data="set_meta"),
-                InlineKeyboardButton("🛠 Custom FFmpeg", callback_data="set_custom"),
-            ],
-            [
-                InlineKeyboardButton(f"{ICONS.watermark} Watermark", callback_data="set_watermark"),
-                InlineKeyboardButton(f"{ICONS.thumb} Thumbnail", callback_data="set_thumbnail"),
-            ],
-            [
-                InlineKeyboardButton("➕ More", callback_data="set_more"),
-            ],
-            [close_btn()],
+            [btn("📦 Output & more", "set_more"), btn(f"{ICONS.metadata} Metadata", "set_meta")],
+            [btn(f"{ICONS.profile} Presets", "set_profiles"), btn("🛠 Advanced", "set_custom")],
+            [btn(f"{ICONS.reset} Reset", "reset_confirm"), close_btn()],
         ]
     )
 
     if query:
-        await safe_edit(message, text, buttons)
+        edited = await _edit_panel(message, text, buttons)
+        if not edited and any(
+            getattr(message, attribute, None)
+            for attribute in ("video", "document", "audio", "animation")
+        ):
+            await message.reply_text(text=text, reply_markup=buttons)
     else:
         await message.reply_text(text=text, reply_markup=buttons)
 
 
-@Client.on_callback_query(filters.regex("^set_"))
+@Client.on_callback_query(filters.regex(r"^(set_|use_profile_|reset_)") & filters.private)
 async def settings_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     message = callback_query.message
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
     if data == "set_main":
+        await _safe_callback_answer(callback_query)
         # Clear state when returning to main menu
         await render_settings_menu(client, message, query=True, user_id=user_id)
         return
 
-    settings = await get_user_settings(user_id)
+    settings = normalize_settings(await get_user_settings(user_id))
 
-    if data == "set_video":
-        v = settings.get("video", {})
-        sample = int(v.get("sample_seconds", 0) or 0)
-        remux = bool(v.get("remux", False))
-        sub_mode = v.get("subtitle_mode", "copy")
+    if data == "set_profiles":
+        current = settings.get("profile", "custom")
+        text = (
+            f"{ICONS.profile} <b>Quality presets</b>\n\n"
+            "<blockquote>Choose a starting point. Trim, resolutions, branding, "
+            "metadata, and delivery settings stay unchanged.</blockquote>"
+        )
+        profile_rows = []
+        for key, preset in QUALITY_PRESETS.items():
+            profile_rows.append(
+                [
+                    btn(
+                        state_label(f"{preset['label']} — {preset['description']}", key == current),
+                        f"use_profile_{key}",
+                    )
+                ]
+            )
+        profile_rows.append([back_btn("set_main")])
+        await _edit_panel(message, text, InlineKeyboardMarkup(profile_rows))
 
-        text = f"{ICONS.video} <b>Video settings</b>\n\nSelect a parameter to edit:"
+    elif data.startswith("use_profile_"):
+        profile = data.replace("use_profile_", "", 1)
+        if profile not in QUALITY_PRESETS:
+            await _safe_callback_answer(callback_query, "Unknown preset.", show_alert=True)
+            return
+        settings = apply_quality_preset(settings, profile)
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            f"{QUALITY_PRESETS[profile]['label']} applied"
+            if saved
+            else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if saved:
+            await render_settings_menu(client, message, query=True, user_id=user_id)
+
+    elif data == "reset_confirm":
+        text = (
+            f"{ICONS.warn} <b>Reset all settings?</b>\n\n"
+            "<blockquote>This restores codec, audio, metadata, and delivery "
+            "defaults and removes saved branding assets. It cannot be undone.</blockquote>"
+        )
+        await _edit_panel(
+            message,
+            text,
+            InlineKeyboardMarkup(
+                [
+                    [btn("↺ Reset everything", "reset_execute")],
+                    [back_btn("set_main")],
+                ]
+            ),
+        )
+
+    elif data == "reset_execute":
+        settings = normalize_settings({})
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            "↺ Defaults restored" if saved else "⚠️ Could not reset — try again.",
+            show_alert=not saved,
+        )
+        if saved:
+            for asset_path in (
+                os.path.join(THUMB_DIR, f"{user_id}.jpg"),
+                os.path.join(WATERMARK_DIR, f"{user_id}.png"),
+                os.path.join(WATERMARK_DIR, "fonts", f"{user_id}.ttf"),
+            ):
+                try:
+                    if os.path.isfile(asset_path):
+                        os.remove(asset_path)
+                except OSError:
+                    pass
+            await render_settings_menu(client, message, query=True, user_id=user_id)
+
+    elif data == "set_video":
+        video = settings["video"]
+        sample = int(video["sample_seconds"])
+        remux = bool(video["remux"])
+        subtitle_mode = video["subtitle_mode"]
+        resolution_count = len(video["resolution"])
+
+        text = (
+            f"{ICONS.video} <b>Video settings</b>\n\n"
+            f"<blockquote>{escape(video['codec'])} · CRF <code>{escape(video['crf'])}</code> · "
+            f"{escape(video['preset'])}\n"
+            f"{resolution_count} output resolution(s) · "
+            f"{'⚡ Remux' if remux else '🎞 Re-encode'}</blockquote>"
+        )
         buttons = InlineKeyboardMarkup(
             [
+                [btn(f"Codec: {video['codec']} ▸", "edit_video_codec")],
                 [
-                    InlineKeyboardButton(
-                        f"Codec: {settings.get('video', {}).get('codec', 'libx264')} ▸",
-                        callback_data="edit_video_codec",
-                    )
+                    btn(f"CRF: {video['crf']} ▸", "edit_video_crf"),
+                    btn(f"Preset: {video['preset']} ▸", "edit_video_preset"),
                 ],
+                [btn(f"📐 Resolutions ({resolution_count}) ▸", "edit_video_res")],
                 [
-                    InlineKeyboardButton(
-                        f"CRF: {settings.get('video', {}).get('crf', '23')} ▸",
-                        callback_data="edit_video_crf",
-                    ),
-                    InlineKeyboardButton(
-                        f"Preset: {settings.get('video', {}).get('preset', 'medium')} ▸",
-                        callback_data="edit_video_preset",
-                    ),
+                    btn("⚡ Remux" if remux else "🎞 Re-encode", "toggle_video_remux"),
+                    btn(f"⏱ Sample: {sample}s" if sample else "⏱ Full", "edit_video_sample"),
                 ],
-                [
-                    InlineKeyboardButton(
-                        "Resolution (Multi) ▸", callback_data="edit_video_res"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        ("⚡ Remux: ON" if remux else "🎞 Re-encode"),
-                        callback_data="toggle_video_remux",
-                    ),
-                    InlineKeyboardButton(
-                        (f"⏱ Sample: {sample}s" if sample else "⏱ Sample: off"),
-                        callback_data="edit_video_sample",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"💬 Subs: {sub_mode}",
-                        callback_data="toggle_video_subs",
-                    ),
-                ],
-                [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
+                [btn(f"💬 Subtitles: {subtitle_mode}", "toggle_video_subs")],
+                [back_btn("set_main")],
             ]
         )
-        await message.edit_text(text=text, reply_markup=buttons)
+        await _edit_panel(message, text, buttons)
 
     elif data == "set_audio":
-        a = settings.get("audio", {})
-        text = f"{ICONS.audio} <b>Audio settings</b>\n\nSelect a parameter to edit:"
+        audio_settings = settings["audio"]
+        text = (
+            f"{ICONS.audio} <b>Audio settings</b>\n\n"
+            f"<blockquote>{escape(audio_settings['codec'])} · "
+            f"{escape(audio_settings['bitrate'])} · track {escape(audio_settings['track'])}</blockquote>"
+        )
         buttons = InlineKeyboardMarkup(
             [
+                [btn(f"Bitrate: {audio_settings['bitrate']} ▸", "edit_audio_bitrate")],
                 [
-                    InlineKeyboardButton(
-                        f"Bitrate: {a.get('bitrate', '128k')} ▸",
-                        callback_data="edit_audio_bitrate",
-                    )
+                    btn(f"Codec: {audio_settings['codec']} ▸", "edit_audio_codec"),
+                    btn(f"Track: {audio_settings['track']} ▸", "edit_audio_track"),
                 ],
-                [
-                    InlineKeyboardButton(
-                        f"Codec: {a.get('codec', 'aac')} ▸",
-                        callback_data="edit_audio_codec",
-                    ),
-                    InlineKeyboardButton(
-                        f"Track: {a.get('track', 'all')} ▸",
-                        callback_data="edit_audio_track",
-                    ),
-                ],
-                [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
+                [back_btn("set_main")],
             ]
         )
-        await message.edit_text(text=text, reply_markup=buttons)
+        await _edit_panel(message, text, buttons)
 
     elif data == "set_more":
-        trim = settings.get("video", {})
-        t_start = float(trim.get("trim_start", 0) or 0)
-        t_end = float(trim.get("trim_end", 0) or 0)
-        rename = (settings.get("rename", {}) or {}).get("pattern", "")
-        as_video = bool(settings.get("output_as_video", False))
-
-        trim_chip = (
-            f"{t_start:.0f}s → {t_end:.0f}s"
-            if t_end > t_start > 0
-            else (f"from {t_start:.0f}s" if t_start > 0 else "off")
+        video = settings["video"]
+        trim_start = float(video["trim_start"])
+        trim_end = float(video["trim_end"])
+        rename = settings["rename"]["pattern"]
+        as_video = bool(settings["output_as_video"])
+        trim_label = (
+            f"{trim_start:g}s → {trim_end:g}s"
+            if trim_end > trim_start
+            else "Off"
         )
+        rename_label = truncate(rename, 22) if rename else "Off"
+        compatibility_note = ""
+        if as_video and (
+            video["codec"] in {"libvpx-vp9", "libaom-av1", "mpeg4"}
+            or video.get("remux")
+            or settings["audio"]["codec"] == "ac3"
+        ):
+            compatibility_note = (
+                "\n<i>⚠️ Some Telegram clients may not preview this streamable "
+                "codec/container; the bot will fall back to a document if needed.</i>"
+            )
 
-        text = "<b>➕ More options</b>\n\nFine-tune how your encodes behave:"
+        text = (
+            "📦 <b>Output & more</b>\n\n"
+            "<blockquote>Choose exactly what is encoded and how each result is named.</blockquote>"
+            f"{compatibility_note}"
+        )
         buttons = InlineKeyboardMarkup(
             [
+                [btn(f"✂️ Trim: {trim_label}", "edit_trim")],
+                [btn(f"✏️ Rename: {rename_label}", "edit_rename")],
                 [
-                    InlineKeyboardButton(f"✂️ Trim: {trim_chip}", callback_data="edit_trim"),
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"✏️ Rename: {(rename[:14] + '…') if len(rename) > 16 else (rename or 'off')}",
-                        callback_data="edit_rename",
+                    btn(
+                        state_label(
+                            "📤 Streamable video" if as_video else "📄 Document",
+                            as_video,
+                        ),
+                        "toggle_output_mode",
                     )
                 ],
-                [
-                    InlineKeyboardButton(
-                        ("📤 Output: video" if as_video else "📄 Output: document"),
-                        callback_data="toggle_output_mode",
-                    )
-                ],
-                [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
+                [back_btn("set_main")],
             ]
         )
-        await message.edit_text(text=text, reply_markup=buttons)
+        await _edit_panel(message, text, buttons)
 
     elif data == "set_meta":
         text = f"{ICONS.metadata} <b>Metadata</b>\n\nSelect a category to edit:"
@@ -292,61 +423,49 @@ async def settings_callback(client, callback_query: CallbackQuery):
                 [InlineKeyboardButton("🔙 Back", callback_data="set_main")],
             ]
         )
-        await message.edit_text(text=text, reply_markup=buttons)
+        await _edit_panel(message, text, buttons)
 
     elif data == "set_custom":
         custom_cmds = settings.get("custom_ffmpeg", {})
-        text = "<b>🛠 Custom FFmpeg commands</b>\n\n<blockquote>Saved commands:</blockquote>\n"
+        active = settings.get("active_custom_ffmpeg", "")
+        text = (
+            "🛠 <b>Advanced FFmpeg overrides</b>\n\n"
+            "<blockquote>Only encoder and container flags are accepted. "
+            "Input, output, protocols, and local file access stay bot-managed.</blockquote>\n"
+        )
+        if custom_cmds:
+            text += f"{ICONS.success} Active: <code>{escape(active) if active else 'none'}</code>"
+        else:
+            text += "<i>No overrides saved yet.</i>"
 
         cmds_buttons = []
-        if custom_cmds:
-            for name, cmd in custom_cmds.items():
-                text += f"• <b>{escape(str(name))}</b>: <code>{escape(str(cmd))}</code>\n"
-                cmds_buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            f"🗑 Delete {name}", callback_data=f"del_custom_{name}"
-                        )
-                    ]
-                )
-        else:
-            text += "<i>No custom commands saved yet.</i>"
+        for name, command in list(custom_cmds.items())[:10]:
+            is_active = name == active
+            use_label = "🔴 Disable" if is_active else f"▶️ Use {name}"
+            use_callback = "toggle_active_custom" if is_active else f"use_custom_{name}"
+            command_label = truncate(str(command), 34)
+            text += (
+                f"\n• <b>{escape(name)}</b>: <code>{escape(command_label)}</code>"
+            )
+            cmds_buttons.append(
+                [
+                    btn(use_label if is_active else "▶️ Use", use_callback),
+                    btn("🗑 Delete", f"del_custom_{name}"),
+                ]
+            )
+        cmds_buttons.append([btn(f"{ICONS.plus} Add override", "add_custom")])
+        cmds_buttons.append([back_btn("set_main")])
 
-        cmds_buttons.append(
-            [InlineKeyboardButton("➕ Add New Command", callback_data="add_custom")]
-        )
-        # Active override toggle (wired into generate_ffmpeg_cmd).
-        active = settings.get("active_custom_ffmpeg")
-        if custom_cmds:
-            if active and active in custom_cmds:
-                cmds_buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            f"🟢 Active: {active}",
-                            callback_data="toggle_active_custom",
-                        )
-                    ]
-                )
-            else:
-                first = next(iter(custom_cmds))
-                cmds_buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            f"🔴 Activate {first}",
-                            callback_data=f"use_custom_{first}",
-                        )
-                    ]
-                )
-        cmds_buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_main")])
-
-        await message.edit_text(
-            text=text, reply_markup=InlineKeyboardMarkup(cmds_buttons)
-        )
+        await _edit_panel(message, text, InlineKeyboardMarkup(cmds_buttons))
 
     elif data == "set_watermark":
+        await _safe_callback_answer(callback_query)
         await watermark_callback(client, callback_query)
         return
 
+    elif data == "set_thumbnail_upload":
+        await _safe_callback_answer(callback_query, "Send a photo to continue…")
+        await thumbnail_callback(client, callback_query)
     elif data.startswith("set_thumbnail"):
         await thumbnail_callback(client, callback_query)
         return
@@ -397,18 +516,26 @@ async def settings_callback(client, callback_query: CallbackQuery):
 
         buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_meta")])
 
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+        await _edit_panel(message, text, InlineKeyboardMarkup(buttons))
 
 
 
-@Client.on_callback_query(filters.regex(r"^(toggle_video_remux|toggle_video_subs|toggle_output_mode)$"))
+@Client.on_callback_query(
+    filters.regex(r"^(toggle_video_remux|toggle_video_subs|toggle_output_mode)$")
+    & filters.private
+)
 async def toggle_simple_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
-    settings = await get_user_settings(user_id)
-    if not settings:
-        settings = copy.deepcopy(DEFAULT_SETTINGS)
+    settings = normalize_settings(await get_user_settings(user_id))
     v = settings.setdefault("video", {})
 
     if data == "toggle_video_remux":
@@ -416,8 +543,11 @@ async def toggle_simple_callback(client, callback_query: CallbackQuery):
         note = "⚡ Remux ON — streams are copied without re-encoding (watermark/scale/CRF ignored)."
         if not v["remux"]:
             note = "🎞 Re-encode restored."
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Updated")
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            note[:200] if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
 
     elif data == "toggle_video_subs":
         v["subtitle_mode"] = "drop" if v.get("subtitle_mode", "copy") == "copy" else "copy"
@@ -426,8 +556,11 @@ async def toggle_simple_callback(client, callback_query: CallbackQuery):
             if v["subtitle_mode"] == "drop"
             else "💬 Subtitles will be copied."
         )
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Updated")
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            note[:200] if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
 
     else:  # toggle_output_mode
         settings["output_as_video"] = not bool(settings.get("output_as_video", False))
@@ -436,22 +569,30 @@ async def toggle_simple_callback(client, callback_query: CallbackQuery):
             if settings["output_as_video"]
             else "📄 Output will be sent as a document."
         )
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Updated")
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            note[:200] if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
 
     callback_query.data = "set_video" if data != "toggle_output_mode" else "set_more"
     await settings_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^edit_"))
+@Client.on_callback_query(filters.regex("^edit_") & filters.private)
 async def edit_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     message = callback_query.message
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
-    settings = await get_user_settings(user_id)
-    if not settings:
-        settings = copy.deepcopy(DEFAULT_SETTINGS)
+    settings = normalize_settings(await get_user_settings(user_id))
 
     if data == "edit_video_res":
         current_res = settings.get("video", {}).get("resolution", ["1080p"])
@@ -459,23 +600,23 @@ async def edit_callback(client, callback_query: CallbackQuery):
             current_res = [current_res]
 
         all_res = ["1080p", "720p", "480p", "360p"]
-
-        buttons = []
-        for res in all_res:
-            icon = "✅" if res in current_res else "❌"
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"{icon} {res}", callback_data=f"toggle_res_{res}"
-                    )
-                ]
-            )
-
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="set_video")])
+        buttons = [
+            [
+                btn(state_label(res, res in current_res, "✅"), f"toggle_res_{res}"),
+                btn(
+                    state_label(res, res in current_res, "✅"),
+                    f"toggle_res_{all_res[index + 1]}",
+                ),
+            ]
+            for index, res in enumerate(all_res[::2])
+        ]
+        buttons.append([back_btn("set_video")])
 
         await safe_edit(
             message,
-            "<b>📐 Resolutions</b>\n<i>Tap to toggle — pick one or more.</i>",
+            f"{ICONS.video} <b>Output resolutions</b>\n"
+            f"<blockquote>{' · '.join(current_res)} selected. "
+            "Every enabled variant will be delivered.</blockquote>",
             InlineKeyboardMarkup(buttons),
         )
         return
@@ -486,7 +627,7 @@ async def edit_callback(client, callback_query: CallbackQuery):
         + "</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
         "edit_video_crf": "<b>🎬 New CRF (0–51)</b>\n<blockquote>Lower = better quality, bigger file.\nDefault: <code>23</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
         "edit_video_preset": "<b>🎬 New preset</b>\n<blockquote><code>ultrafast</code> … <code>veryslow</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
-        "edit_audio_bitrate": "<b>🎵 New audio bitrate</b>\n<blockquote>Examples: <code>128k</code>, <code>192k</code>, <code>320k</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
+        "edit_audio_bitrate": "<b>🎵 New audio bitrate</b>\n<blockquote>Range: <code>32k</code>–<code>512k</code><br>Examples: <code>128k</code> · <code>192k</code> · <code>320k</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
         "edit_audio_codec": "<b>🎵 New audio codec</b>\n<blockquote>Valid options:\n<code>"
         + "</code>, <code>".join(sorted(VALID_AUDIO_CODECS))
         + "</code></blockquote>\n<i>Type a value below, or press Cancel.</i>",
@@ -502,23 +643,32 @@ async def edit_callback(client, callback_query: CallbackQuery):
         prompt = prompts.get(data)
 
     if not prompt:
-        await callback_query.answer()
+        await _safe_callback_answer(callback_query)
         return
 
     prompt_msg = None
     try:
-        prompt_msg = await message.edit_text(
-            text=prompt,
-            reply_markup=InlineKeyboardMarkup(
+        prompt_msg = await _edit_panel(
+            message,
+            prompt,
+            InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]
             ),
         )
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
-        text = input_msg.text
-        await input_msg.delete()
+        await _safe_callback_answer(callback_query, "Waiting for your input…")
+        input_msg = await listen_once(
+            client, user_id, prompt_msg.id, f"settings:{data}", 60
+        )
+        text = (input_msg.text or "").strip()
+        try:
+            await input_msg.delete()
+        except Exception:
+            pass
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
         # Restore the settings menu instead of deleting the prompt.
-        await callback_query.answer("⏰ Timed out.", show_alert=False)
         try:
             callback_query.data = "set_main"
             await settings_callback(client, callback_query)
@@ -540,11 +690,14 @@ async def edit_callback(client, callback_query: CallbackQuery):
         return
 
     if not text:
-        await callback_query.answer("❌ Please send text (or press Cancel).", show_alert=True)
+        callback_query.data = "set_main"
+        await settings_callback(client, callback_query)
         return
 
+    settings = normalize_settings(await get_user_settings(user_id))
+
     async def invalid(msg: str):
-        await callback_query.answer(f"❌ {msg[:180]}", show_alert=True)
+        await message.reply_text(f"⚠️ {escape(msg[:180])}")
         await render_settings_menu(client, message, query=True, user_id=user_id)
 
     if data == "edit_video_codec":
@@ -566,10 +719,15 @@ async def edit_callback(client, callback_query: CallbackQuery):
         settings.setdefault("video", {})["preset"] = text.lower()
 
     elif data == "edit_audio_bitrate":
-        if not text.endswith("k") or not text[:-1].isdigit():
-            await invalid("Format: 128k, 192k, etc.")
+        value = text.lower()
+        if (
+            not value.endswith("k")
+            or not value[:-1].isdigit()
+            or not (32 <= int(value[:-1]) <= 512)
+        ):
+            await invalid("Choose a bitrate from 32k to 512k (for example 128k).")
             return
-        settings.setdefault("audio", {})["bitrate"] = text
+        settings.setdefault("audio", {})["bitrate"] = value
 
     elif data == "edit_audio_codec":
         if text.strip() not in VALID_AUDIO_CODECS:
@@ -579,8 +737,8 @@ async def edit_callback(client, callback_query: CallbackQuery):
 
     elif data == "edit_audio_track":
         val = text.strip().lower()
-        if val not in ("all", "none") and not val.isdigit():
-            await invalid("Use: all / none / a track number like 1.")
+        if val not in ("all", "none") and not (val.isdigit() and int(val) >= 1):
+            await invalid("Use all, none, or a 1-based track number like 1.")
             return
         settings.setdefault("audio", {})["track"] = val
 
@@ -623,10 +781,7 @@ async def edit_callback(client, callback_query: CallbackQuery):
             await invalid("Pattern too long (max 60 chars).")
             return
         else:
-            # Reject patterns that would explode at format time.
-            try:
-                val.format(original="", res="", codec="", date="")
-            except (KeyError, IndexError, ValueError):
+            if not _valid_rename_pattern(val):
                 await invalid(
                     "Unknown placeholder. Allowed: {original} {res} {codec} {date}"
                 )
@@ -635,6 +790,9 @@ async def edit_callback(client, callback_query: CallbackQuery):
 
     elif data.startswith("edit_meta_val_"):
         category, key = data.split("_", 3)[-1].split("|")
+        if len(text) > 500:
+            await invalid("Metadata values are limited to 500 characters.")
+            return
 
         if "metadata" not in settings:
             settings["metadata"] = {}
@@ -643,73 +801,107 @@ async def edit_callback(client, callback_query: CallbackQuery):
 
         if text.lower() == "clear":
             settings["metadata"][category].pop(key, None)
-            await callback_query.answer(f"🗑 Cleared {category} · {key}", show_alert=False)
+            change_text = f"🗑 Cleared {category} · {key}"
         else:
             settings["metadata"][category][key] = text
-            await callback_query.answer(
-                f"✅ Set {category} · {key}", show_alert=False
-            )
-        await update_user_settings(user_id, settings)
+            change_text = f"✅ Set {category} · {key}"
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(
+            callback_query,
+            change_text if saved else "⚠️ Could not save — please try again.",
+            show_alert=not saved,
+        )
+        if not saved:
+            return
         callback_query.data = f"set_meta_cat_{category}"
         await settings_callback(client, callback_query)
         return
 
+    if data.startswith(("edit_video_", "edit_audio_")):
+        settings["profile"] = "custom"
+
     saved = await update_user_settings(user_id, settings)
     if saved:
-        await callback_query.answer("✅ Setting saved", show_alert=False)
+        await _safe_callback_answer(callback_query, "✅ Setting saved")
     else:
-        await callback_query.answer(
-            "⚠️ Could not save — please try again.", show_alert=True
+        await _safe_callback_answer(callback_query, "⚠️ Could not save — please try again.", show_alert=True
         )
 
     await render_settings_menu(client, message, query=True, user_id=user_id)
 
 
-@Client.on_callback_query(filters.regex("^toggle_res_"))
+@Client.on_callback_query(filters.regex("^toggle_res_") & filters.private)
 async def toggle_res_callback(client, callback_query: CallbackQuery):
     res = callback_query.data.replace("toggle_res_", "")
     user_id = callback_query.from_user.id
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
-    settings = await get_user_settings(user_id)
-    if "video" not in settings:
-        settings["video"] = {}
-
-    current_res = settings["video"].get("resolution", ["1080p"])
-    if isinstance(current_res, str):
-        current_res = [current_res]
+    settings = normalize_settings(await get_user_settings(user_id))
+    current_res = settings["video"]["resolution"]
 
     if res in current_res:
         if len(current_res) > 1:
             current_res.remove(res)
         else:
-            await callback_query.answer("⚠️ At least one resolution must stay enabled.", show_alert=True)
+            await _safe_callback_answer(callback_query, "⚠️ At least one resolution must stay enabled.", show_alert=True)
             return
     else:
         current_res.append(res)
 
     settings["video"]["resolution"] = current_res
-    await update_user_settings(user_id, settings)
-    await callback_query.answer("✅ Toggled")
+    saved = await update_user_settings(user_id, settings)
+    await _safe_callback_answer(callback_query,
+        "✅ Toggled" if saved else "⚠️ Could not save — try again.",
+        show_alert=not saved,
+    )
+    if not saved:
+        return
 
     callback_query.data = "edit_video_res"
     await edit_callback(client, callback_query)
 
-@Client.on_callback_query(filters.regex("^add_custom"))
+@Client.on_callback_query(filters.regex("^add_custom") & filters.private)
 async def add_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
     # 1. Ask for Name
     text = "<b>1. Name your custom command</b>\n<blockquote>Example: <code>my_1080p_preset</code></blockquote>\n<i>1–32 chars: letters, numbers, _ and -</i>"
-    prompt_msg = await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
+    prompt_msg = await _edit_panel(
+        message,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    )
+    await _safe_callback_answer(callback_query, "Waiting for your input…")
 
     try:
-        name_msg = await client.listen(chat_id=user_id, timeout=60)
-        name = name_msg.text
-        await name_msg.delete()
+        name_msg = await listen_once(
+            client, user_id, prompt_msg.id, "custom:name", 60
+        )
+        name = (name_msg.text or "").strip()
+        try:
+            await name_msg.delete()
+        except Exception:
+            pass
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
         # Keep the menu; just toast the timeout.
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_custom"
             await settings_callback(client, callback_query)
@@ -727,26 +919,48 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         return
 
     if not name:
-        await callback_query.answer("❌ Please send a text name.", show_alert=True)
+        await _safe_callback_answer(callback_query, "❌ Please send a text name.", show_alert=True)
+        callback_query.data = "set_custom"
+        await settings_callback(client, callback_query)
         return
 
     safe_name = sanitize_custom_name(name)
     if not safe_name:
-        await callback_query.answer(
-            "❌ Use 1–32 chars: letters, numbers, _ and - only.", show_alert=True
+        await _safe_callback_answer(callback_query,
+            "❌ Use 1–32 chars: letters, numbers, _ and - only.",
+            show_alert=True,
         )
+        callback_query.data = "set_custom"
+        await settings_callback(client, callback_query)
         return
 
     # 2. Ask for Command
-    text = f"<b>2. FFmpeg args for <code>{escape(safe_name)}</code></b>\n<blockquote>Example: <code>-c:v libx264 -crf 23</code></blockquote>\n<i>Input (<code>-i</code>) and overwrite (<code>-y</code>) are managed by the bot.</i>"
-    await prompt_msg.edit_text(text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
+    text = (
+        f"<b>2. FFmpeg args for <code>{escape(safe_name)}</code></b>\n"
+        "<blockquote>Example: <code>-crf 23 -preset fast</code></blockquote>\n"
+        "<i>Use bounded quality/container flags. Codecs, stream mapping, paths, "
+        "protocols, input, and output remain bot-managed.</i>"
+    )
+    await _edit_panel(
+        prompt_msg,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    )
 
     try:
-        cmd_msg = await client.listen(chat_id=user_id, timeout=60)
-        cmd = cmd_msg.text
-        await cmd_msg.delete()
+        cmd_msg = await listen_once(
+            client, user_id, message.id, "custom:command", 60
+        )
+        cmd = (cmd_msg.text or "").strip()
+        try:
+            await cmd_msg.delete()
+        except Exception:
+            pass
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_custom"
             await settings_callback(client, callback_query)
@@ -763,80 +977,121 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
         await settings_callback(client, callback_query)
         return
 
-    # Validate
+    # Validate before persisting. The allowlist prevents local-file and
+    # protocol access while still allowing useful encoder/container knobs.
     if not validate_ffmpeg_command(cmd):
-        await callback_query.answer(
-            "❌ Invalid command: forbidden flags (-i, -y) or empty.", show_alert=True
+        await _safe_callback_answer(callback_query,
+            "❌ Use only supported encoder/container flags; paths, protocols, "
+            "input, and output are managed by the bot.",
+            show_alert=True,
         )
+        callback_query.data = "set_custom"
+        await settings_callback(client, callback_query)
         return
 
-    settings = await get_user_settings(user_id)
+    settings = normalize_settings(await get_user_settings(user_id))
     if "custom_ffmpeg" not in settings:
         settings["custom_ffmpeg"] = {}
     settings["custom_ffmpeg"][safe_name] = cmd
     saved = await update_user_settings(user_id, settings)
 
     if saved:
-        await callback_query.answer(f"✅ Custom command “{safe_name}” saved", show_alert=False)
+        await _safe_callback_answer(callback_query, f"✅ Custom command “{safe_name}” saved", show_alert=False
+        )
     else:
-        await callback_query.answer("⚠️ Could not save — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⚠️ Could not save — try again.", show_alert=True
+        )
 
     # Return to custom menu
     callback_query.data = "set_custom"
     await settings_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^del_custom_"))
+@Client.on_callback_query(filters.regex("^del_custom_") & filters.private)
 async def del_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     name = callback_query.data.replace("del_custom_", "")
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
 
-    settings = await get_user_settings(user_id)
-    if "custom_ffmpeg" in settings and name in settings["custom_ffmpeg"]:
+    settings = normalize_settings(await get_user_settings(user_id))
+    if name in settings["custom_ffmpeg"]:
         del settings["custom_ffmpeg"][name]
         if settings.get("active_custom_ffmpeg") == name:
             settings["active_custom_ffmpeg"] = ""
-            settings["active_custom_ffmpeg"] = ""
-        await update_user_settings(user_id, settings)
+        saved = await update_user_settings(user_id, settings)
+        if not saved:
+            await _safe_callback_answer(callback_query, "⚠️ Could not delete — try again.", show_alert=True)
+            return
 
     # Refresh custom menu
     callback_query.data = "set_custom"
     await settings_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex(r"^(toggle_active_custom|use_custom_)"))
+@Client.on_callback_query(
+    filters.regex(r"^(toggle_active_custom|use_custom_)") & filters.private
+)
 async def active_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
-    settings = await get_user_settings(user_id)
-    custom = settings.get("custom_ffmpeg", {}) or {}
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
+    settings = normalize_settings(await get_user_settings(user_id))
+    custom = settings["custom_ffmpeg"]
 
     if data == "toggle_active_custom":
         settings["active_custom_ffmpeg"] = ""
-        await callback_query.answer("🔴 Custom FFmpeg override off")
+        change_text = "🔴 Custom FFmpeg override off"
     else:
         name = data.replace("use_custom_", "")
         if name in custom:
             settings["active_custom_ffmpeg"] = name
-            await callback_query.answer(f"🟢 Using custom: {name}")
+            change_text = f"🟢 Using custom: {name}"
         else:
-            await callback_query.answer("❌ Not found.", show_alert=True)
+            await _safe_callback_answer(callback_query, "❌ Not found.", show_alert=True)
             return
 
-    await update_user_settings(user_id, settings)
+    saved = await update_user_settings(user_id, settings)
+    await _safe_callback_answer(
+        callback_query,
+        change_text if saved else "⚠️ Could not save — try again.",
+        show_alert=not saved,
+    )
+    if not saved:
+        return
     callback_query.data = "set_custom"
     await settings_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^wm_(toggle|select|set|preview)"))
+@Client.on_callback_query(
+    filters.regex("^wm_(toggle|select|set|preview)") & filters.private
+)
 async def watermark_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     message = callback_query.message
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     log.info(f"Watermark Callback: {data} for user {user_id}")
 
-    settings = await get_user_settings(user_id)
-    wm = settings.get("watermark", {})
+    settings = normalize_settings(await get_user_settings(user_id))
+    wm = settings["watermark"]
 
     # Defaults
     if "enabled" not in wm: wm["enabled"] = False
@@ -862,7 +1117,11 @@ async def watermark_callback(client, callback_query: CallbackQuery):
         )
 
         if wm['type'] == 'text':
-            has_font = "✅ Custom" if os.path.exists(f"watermarks/fonts/{user_id}.ttf") else "🤖 Default"
+            has_font = (
+                "✅ Custom"
+                if os.path.isfile(os.path.join(WATERMARK_DIR, "fonts", f"{user_id}.ttf"))
+                else "🤖 Default"
+            )
             text += (
                 f"📝 <b>Text Settings:</b>\n"
                 f"<blockquote>• <b>Content:</b> <code>{escape(str(wm['text']))}</code>\n"
@@ -871,7 +1130,11 @@ async def watermark_callback(client, callback_query: CallbackQuery):
                 f"• <b>Font:</b> {has_font}</blockquote>"
             )
         elif wm['type'] == 'image':
-            has_img = "✅ Uploaded" if wm.get("image_path") else "❌ Not Set"
+            has_img = (
+                "✅ Uploaded"
+                if wm.get("image_path") and os.path.isfile(str(wm.get("image_path")))
+                else "❌ Not set"
+            )
             text += f"🖼 <b>Image Settings:</b>\n<blockquote>• <b>File:</b> {has_img}\n• <b>Scale:</b> {wm.get('scale', '0.1')}</blockquote>"
 
         # Toggle Button
@@ -882,13 +1145,15 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             [
                 toggle_btn,
                 InlineKeyboardButton(f"Type: {wm['type'].upper()}", callback_data="wm_select_type"),
-                InlineKeyboardButton(f"Pos: {wm['position'].title()}", callback_data="wm_select_pos"),
             ],
             [
+                InlineKeyboardButton(f"Pos: {wm['position'].title()}", callback_data="wm_select_pos"),
                 InlineKeyboardButton(f"Opacity: {wm['opacity']}", callback_data="wm_edit_opacity"),
+            ],
+            [
                 InlineKeyboardButton(f"Timing: {wm['timing_mode'].title()}", callback_data="wm_toggle_timing"),
-                InlineKeyboardButton("📏 Margins", callback_data="wm_select_margins")
-            ]
+                InlineKeyboardButton("📏 Margins", callback_data="wm_select_margins"),
+            ],
         ]
 
         # Dynamic Buttons based on Type
@@ -917,14 +1182,27 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             InlineKeyboardButton("🔙 Back", callback_data="set_main")
         ])
 
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+        await _edit_panel(message, text, InlineKeyboardMarkup(buttons))
 
     elif data == "wm_toggle_enable":
-        wm['enabled'] = not wm['enabled']
-        if "watermark" not in settings: settings["watermark"] = {}
-        settings["watermark"]["enabled"] = wm['enabled']
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Updated", show_alert=False)
+        image_ready = bool(wm.get("image_path")) and os.path.isfile(
+            str(wm.get("image_path"))
+        )
+        if not wm["enabled"] and wm["type"] == "image" and not image_ready:
+            await _safe_callback_answer(callback_query,
+                "Upload a watermark image before enabling it.", show_alert=True
+            )
+            return
+        wm["enabled"] = not wm["enabled"]
+        settings["watermark"]["enabled"] = wm["enabled"]
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(
+            callback_query,
+            "✅ Watermark updated" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if not saved:
+            return
 
         callback_query.data = "set_watermark"
         await watermark_callback(client, callback_query)
@@ -936,14 +1214,20 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("🖼 Image", callback_data="wm_set_type_image")],
             [InlineKeyboardButton("🔙 Back", callback_data="set_watermark")]
         ]
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+        await _edit_panel(message, text, InlineKeyboardMarkup(buttons))
 
     elif data.startswith("wm_set_type_"):
         new_type = data.split("_")[-1]
         if "watermark" not in settings: settings["watermark"] = {}
         settings["watermark"]["type"] = new_type
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Type Updated", show_alert=False)
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(
+            callback_query,
+            "✅ Type Updated" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if not saved:
+            return
 
         callback_query.data = "set_watermark"
         await watermark_callback(client, callback_query)
@@ -955,13 +1239,16 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             [InlineKeyboardButton("↙️ Bottom-Left", callback_data="wm_set_pos_bottom-left"), InlineKeyboardButton("↘️ Bottom-Right", callback_data="wm_set_pos_bottom-right")],
             [InlineKeyboardButton("🔙 Back", callback_data="set_watermark")]
         ]
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+        await _edit_panel(message, text, InlineKeyboardMarkup(buttons))
 
     elif data.startswith("wm_set_pos_"):
         new_pos = data.replace("wm_set_pos_", "")
         if "watermark" not in settings: settings["watermark"] = {}
         settings["watermark"]["position"] = new_pos
-        await update_user_settings(user_id, settings)
+        saved = await update_user_settings(user_id, settings)
+        if not saved:
+            await _safe_callback_answer(callback_query, "⚠️ Could not save — try again.", show_alert=True)
+            return
 
         callback_query.data = "set_watermark"
         await watermark_callback(client, callback_query)
@@ -973,7 +1260,10 @@ async def watermark_callback(client, callback_query: CallbackQuery):
 
         if "watermark" not in settings: settings["watermark"] = {}
         settings["watermark"]["timing_mode"] = new_mode
-        await update_user_settings(user_id, settings)
+        saved = await update_user_settings(user_id, settings)
+        if not saved:
+            await _safe_callback_answer(callback_query, "⚠️ Could not save — try again.", show_alert=True)
+            return
 
         callback_query.data = "set_watermark"
         await watermark_callback(client, callback_query)
@@ -992,33 +1282,68 @@ async def watermark_callback(client, callback_query: CallbackQuery):
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="set_watermark")]
         ]
-        await message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(buttons))
+        await _edit_panel(message, text, InlineKeyboardMarkup(buttons))
 
     elif data == "wm_preview":
+        await _safe_callback_answer(callback_query, "Generating preview…")
         await message.reply_text("⏳ Generating preview…")
 
         from bot.func.preview import generate_preview
         preview_path = await generate_preview(user_id, settings)
 
         if preview_path and os.path.exists(preview_path):
-            await message.reply_photo(
-                photo=preview_path,
-                caption=f"{ICONS.watermark} <b>Watermark preview</b>",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Delete", callback_data="cb_close")]])
-            )
-            os.remove(preview_path)
+            preview_thumb = None
+            try:
+                preview_thumb = await prepare_telegram_thumbnail(
+                    preview_path,
+                    destination=os.path.join(
+                        THUMB_DIR, f"preview_{user_id}_{uuid.uuid4().hex[:8]}.jpg"
+                    ),
+                )
+                keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🗑 Delete", callback_data="cb_close")]]
+                )
+                if preview_thumb:
+                    await message.reply_photo(
+                        photo=preview_thumb,
+                        caption=f"{ICONS.watermark} <b>Watermark preview</b>",
+                        reply_markup=keyboard,
+                    )
+                else:
+                    await message.reply_document(
+                        document=preview_path,
+                        caption=f"{ICONS.watermark} <b>Watermark preview</b>",
+                        reply_markup=keyboard,
+                    )
+            finally:
+                for path in {preview_path, preview_thumb}:
+                    if path:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
         else:
-            await callback_query.answer("❌ Preview failed — check your watermark settings.", show_alert=True)
+            await _safe_callback_answer(callback_query,
+                "❌ Preview failed — check your watermark settings.",
+                show_alert=True,
+            )
 
 
-@Client.on_callback_query(filters.regex("^wm_edit_"))
+@Client.on_callback_query(filters.regex("^wm_edit_") & filters.private)
 async def wm_edit_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     message = callback_query.message
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     log.info(f"WM Edit Callback: {data} for user {user_id}")
 
-    settings = await get_user_settings(user_id)
+    settings = normalize_settings(await get_user_settings(user_id))
 
     prompt = ""
     if data == "wm_edit_text":
@@ -1035,15 +1360,28 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
         side = data.split("_")[-1].title()
         prompt = f"<b>💧 {side} margin</b>\n<blockquote>Distance in pixels.</blockquote>"
 
-    prompt_msg = await message.edit_text(text=prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
+    prompt_msg = await _edit_panel(
+        message,
+        prompt,
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    )
+    await _safe_callback_answer(callback_query, "Waiting for your input…")
 
     try:
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
-        text = input_msg.text
-        await input_msg.delete()
+        input_msg = await listen_once(
+            client, user_id, prompt_msg.id, f"settings:{data}", 60
+        )
+        text = (input_msg.text or "").strip()
+        try:
+            await input_msg.delete()
+        except Exception:
+            pass
         log.info(f"WM Edit Input: {text}")
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_watermark"
             await watermark_callback(client, callback_query)
@@ -1060,13 +1398,24 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
         await watermark_callback(client, callback_query)
         return
 
-    if "watermark" not in settings: settings["watermark"] = {}
+    async def reject_watermark(reason: str):
+        await _safe_callback_answer(callback_query, reason, show_alert=True)
+        callback_query.data = "set_watermark"
+        await watermark_callback(client, callback_query)
 
+    if not text:
+        await reject_watermark("❌ Send a value, or press Cancel.")
+        return
+
+    settings = normalize_settings(await get_user_settings(user_id))
     if data == "wm_edit_text":
+        if len(text) > 200:
+            await reject_watermark("❌ Watermark text is limited to 200 characters.")
+            return
         settings["watermark"]["text"] = text
     elif data == "wm_edit_size":
         if not text.isdigit() or not (10 <= int(text) <= 100):
-            await callback_query.answer("❌ Size must be 10–100.", show_alert=True)
+            await reject_watermark("❌ Size must be 10–100.")
             return
         settings["watermark"]["font_size"] = text
     elif data == "wm_edit_opacity":
@@ -1074,7 +1423,7 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
             val = float(text)
             if not (0.1 <= val <= 1.0): raise ValueError
         except ValueError:
-            await callback_query.answer("❌ Opacity must be 0.1–1.0.", show_alert=True)
+            await reject_watermark("❌ Opacity must be 0.1–1.0.")
             return
         settings["watermark"]["opacity"] = text
     elif data == "wm_edit_border_opacity":
@@ -1082,7 +1431,7 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
             val = float(text)
             if not (0.0 <= val <= 1.0): raise ValueError
         except ValueError:
-            await callback_query.answer("❌ Border opacity must be 0.0–1.0.", show_alert=True)
+            await reject_watermark("❌ Border opacity must be 0.0–1.0.")
             return
         settings["watermark"]["border_opacity"] = text
     elif data == "wm_edit_scale":
@@ -1090,74 +1439,131 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
             val = float(text)
             if not (0.1 <= val <= 1.0): raise ValueError
         except ValueError:
-            await callback_query.answer("❌ Scale must be 0.1–1.0.", show_alert=True)
+            await reject_watermark("❌ Scale must be 0.1–1.0.")
             return
         settings["watermark"]["scale"] = text
     elif data.startswith("wm_edit_margin_"):
         side = data.split("_")[-1]
-        if not text.isdigit():
-            await callback_query.answer("❌ Enter a valid integer.", show_alert=True)
+        if not text.isdigit() or not (0 <= int(text) <= 500):
+            await reject_watermark("❌ Margin must be between 0 and 500 pixels.")
             return
-        if "margins" not in settings["watermark"]: settings["watermark"]["margins"] = {}
         settings["watermark"]["margins"][side] = int(text)
 
-        await update_user_settings(user_id, settings)
-        await callback_query.answer(f"✅ {side.title()} margin updated", show_alert=False)
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(
+            callback_query,
+            f"✅ {side.title()} margin updated" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if not saved:
+            return
 
         # Return to margin menu
         callback_query.data = "wm_select_margins"
         await watermark_callback(client, callback_query)
         return
 
-    await update_user_settings(user_id, settings)
-    await callback_query.answer("✅ Saved", show_alert=False)
+    saved = await update_user_settings(user_id, settings)
+    await _safe_callback_answer(
+        callback_query,
+        "✅ Saved" if saved else "⚠️ Could not save — try again.",
+        show_alert=not saved,
+    )
+    if not saved:
+        return
 
     # Return
     callback_query.data = "set_watermark"
     await watermark_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^wm_upload_img"))
+@Client.on_callback_query(filters.regex("^wm_upload_img") & filters.private)
 async def wm_upload_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
+    data = callback_query.data
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     log.info(f"WM Upload Callback for user {user_id}")
 
-    prompt_msg = await message.edit_text(
-        text="<b>📤 Send your watermark image</b>\n<blockquote>PNG or JPG · max 5 MB</blockquote>\n<i>Press Cancel to abort.</i>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    prompt_msg = await _edit_panel(
+        message,
+        "<b>📤 Send your watermark image</b>\n<blockquote>PNG or JPG · max 5 MB</blockquote>\n<i>Press Cancel to abort.</i>",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
     )
+    await _safe_callback_answer(callback_query, "Waiting for your image…")
 
     try:
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
+        input_msg = await listen_once(
+            client, user_id, prompt_msg.id, f"settings:{data}", 60
+        )
         if not input_msg.photo and not input_msg.document:
-            await callback_query.answer("❌ Not an image.", show_alert=True)
+            await _safe_callback_answer(callback_query, "❌ Send a PNG or JPG image.", show_alert=True
+            )
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
             return
 
         doc = input_msg.document or input_msg.photo
-        if getattr(doc, "file_size", 0) and doc.file_size > 5 * 1024 * 1024:
-            await callback_query.answer("❌ Image too large (max 5 MB).", show_alert=True)
+        mime_type = str(getattr(doc, "mime_type", "") or "")
+        file_name = str(getattr(doc, "file_name", "") or "")
+        looks_like_image = mime_type.startswith("image/") or file_name.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp")
+        )
+        if not input_msg.photo and not looks_like_image:
+            await _safe_callback_answer(callback_query, "❌ Send a PNG or JPG image.", show_alert=True
+            )
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
             return
 
-        # Download
-        os.makedirs("watermarks", exist_ok=True)
-        save_path = os.path.join(os.getcwd(), "watermarks", f"{user_id}.png")
-        path = await input_msg.download(file_name=save_path)
-        await input_msg.delete()
+        if getattr(doc, "file_size", 0) and doc.file_size > 5 * 1024 * 1024:
+            await _safe_callback_answer(callback_query, "❌ Image too large (max 5 MB).", show_alert=True
+            )
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+            return
 
-        settings = await get_user_settings(user_id)
-        if "watermark" not in settings: settings["watermark"] = {}
-        settings["watermark"]["image_path"] = path
-        settings["watermark"].pop("image_data", None)  # never store blobs in Mongo
+        os.makedirs(WATERMARK_DIR, exist_ok=True)
+        final_path = os.path.join(WATERMARK_DIR, f"{user_id}.png")
+        temp_path = os.path.join(
+            WATERMARK_DIR, f"{user_id}_{uuid.uuid4().hex[:8]}.upload"
+        )
+        path = await input_msg.download(file_name=temp_path)
+        try:
+            await input_msg.delete()
+        except Exception:
+            pass
+        if not path or not os.path.isfile(path):
+            raise RuntimeError("image download did not produce a file")
+        os.replace(path, final_path)
+
+        settings = normalize_settings(await get_user_settings(user_id))
+        settings["watermark"]["image_path"] = final_path
+        settings["watermark"].pop("image_data", None)
+        settings["watermark"]["scale"] = settings["watermark"].get("scale", 0.1)
         saved = await update_user_settings(user_id, settings)
+        if not saved:
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
 
-        if saved:
-            await callback_query.answer("✅ Watermark image saved", show_alert=False)
-        else:
-            await callback_query.answer("⚠️ Could not save — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query,
+            "✅ Watermark image saved" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
 
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_watermark"
             await watermark_callback(client, callback_query)
@@ -1174,6 +1580,12 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
              await watermark_callback(client, callback_query)
              return
         log.error(f"WM Upload Error: {e}")
+        temp_path = locals().get("temp_path")
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         try:
             await prompt_msg.delete()
         except Exception:
@@ -1186,13 +1598,21 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
     await watermark_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^wm_config_timing"))
+@Client.on_callback_query(filters.regex("^wm_config_timing") & filters.private)
 async def wm_timing_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
+    data = callback_query.data
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     log.info(f"WM Timing Callback for user {user_id}")
-    settings = await get_user_settings(user_id)
-    mode = settings.get("watermark", {}).get("timing_mode", "always")
+    settings = normalize_settings(await get_user_settings(user_id))
+    mode = settings["watermark"]["timing_mode"]
 
     prompt = ""
     if mode == "range":
@@ -1200,42 +1620,68 @@ async def wm_timing_callback(client, callback_query: CallbackQuery):
     elif mode == "interval":
         prompt = "<b>⏱ Interval mode</b>\n<blockquote>Send <code>duration period</code> — e.g. <code>5 30</code> shows for 5s every 30s.</blockquote>"
     else:
-        await callback_query.answer("Mode is Always — no config needed.", show_alert=True)
+        await _safe_callback_answer(callback_query, "Mode is Always — no config needed.", show_alert=True)
         return
 
-    prompt_msg = await message.edit_text(text=prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]))
+    prompt_msg = await _edit_panel(
+        message,
+        prompt,
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    )
+    await _safe_callback_answer(callback_query, "Waiting for your input…")
 
     try:
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
-        text = input_msg.text
-        await input_msg.delete()
+        input_msg = await listen_once(
+            client, user_id, prompt_msg.id, f"settings:{data}", 60
+        )
+        text = (input_msg.text or "").strip()
+        try:
+            await input_msg.delete()
+        except Exception:
+            pass
 
-        # Validate and Save
-        parts = text.split()
+        async def reject_timing(reason: str):
+            await _safe_callback_answer(callback_query, reason, show_alert=True)
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
+
+        settings = normalize_settings(await get_user_settings(user_id))
+        parts = text.split() if text else []
         if len(parts) != 2:
-            await callback_query.answer("❌ Format: two numbers (e.g. 10 60).", show_alert=True)
+            await reject_timing("❌ Format: two numbers (e.g. 10 60).")
             return
-
         try:
             v1, v2 = float(parts[0]), float(parts[1])
         except ValueError:
-            await callback_query.answer("❌ Numbers only.", show_alert=True)
+            await reject_timing("❌ Send two valid numbers.")
             return
 
-        if "watermark" not in settings: settings["watermark"] = {}
+        if mode == "range" and (v1 < 0 or v2 <= v1):
+            await reject_timing("❌ Range end must be greater than start.")
+            return
+        if mode == "interval" and (v1 <= 0 or v2 <= 0 or v1 > v2):
+            await reject_timing("❌ Duration must be positive and no longer than the period.")
+            return
 
         if mode == "range":
             settings["watermark"]["start_time"] = v1
             settings["watermark"]["end_time"] = v2
-        elif mode == "interval":
+        else:
             settings["watermark"]["interval_duration"] = v1
             settings["watermark"]["interval_period"] = v2
 
-        await update_user_settings(user_id, settings)
-        await callback_query.answer("✅ Timing updated", show_alert=False)
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(
+            callback_query,
+            "✅ Timing updated" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
 
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_watermark"
             await watermark_callback(client, callback_query)
@@ -1257,10 +1703,18 @@ async def wm_timing_callback(client, callback_query: CallbackQuery):
     await watermark_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^wm_upload_font"))
+@Client.on_callback_query(filters.regex("^wm_upload_font") & filters.private)
 async def wm_upload_font_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
+    data = callback_query.data
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     log.info(f"WM Font Upload Callback for user {user_id}")
 
     text = (
@@ -1268,42 +1722,72 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
         "<blockquote>TTF or OTF · max 5 MB</blockquote>\n"
         "<i>Press Cancel to abort.</i>"
     )
-    await callback_query.answer()
-    prompt_msg = await message.edit_text(
-        text=text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
+    await _safe_callback_answer(callback_query, "Send a font file to continue…")
+    prompt_msg = await _edit_panel(
+        message,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]),
     )
 
     try:
-        input_msg = await client.listen(chat_id=user_id, timeout=60)
-        if not input_msg.document or not input_msg.document.file_name.lower().endswith(('.ttf', '.otf')):
-            await callback_query.answer("❌ Send a TTF/OTF font file.", show_alert=True)
+        input_msg = await listen_once(
+            client, user_id, prompt_msg.id, f"settings:{data}", 60
+        )
+        file_name = (
+            str(input_msg.document.file_name).lower()
+            if input_msg.document and input_msg.document.file_name
+            else ""
+        )
+        if not input_msg.document or not file_name.endswith((".ttf", ".otf")):
+            await _safe_callback_answer(callback_query, "❌ Send a TTF or OTF font file.", show_alert=True
+            )
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
             return
 
-        if input_msg.document.file_size > 5 * 1024 * 1024:
-            await callback_query.answer("❌ Font too large (max 5 MB).", show_alert=True)
+        if int(getattr(input_msg.document, "file_size", 0) or 0) > 5 * 1024 * 1024:
+            await _safe_callback_answer(callback_query, "❌ Font too large (max 5 MB).", show_alert=True
+            )
+            callback_query.data = "set_watermark"
+            await watermark_callback(client, callback_query)
             return
 
-        # Ensure directory
-        if not os.path.exists("watermarks/fonts"):
-            os.makedirs("watermarks/fonts")
+        font_dir = os.path.join(WATERMARK_DIR, "fonts")
+        os.makedirs(font_dir, exist_ok=True)
+        final_font_path = os.path.join(font_dir, f"{user_id}.ttf")
+        temp_font_path = os.path.join(
+            font_dir, f"{user_id}_{uuid.uuid4().hex[:8]}.upload"
+        )
+        path = await input_msg.download(file_name=temp_font_path)
+        try:
+            await input_msg.delete()
+        except Exception:
+            pass
+        if not path or not os.path.isfile(path):
+            raise RuntimeError("font download did not produce a file")
+        os.replace(path, final_font_path)
 
-        # Download
-        path = await input_msg.download(file_name=f"watermarks/fonts/{user_id}.ttf")
-        await input_msg.delete()
-
-        settings = await get_user_settings(user_id)
-        if "watermark" not in settings: settings["watermark"] = {}
-        settings["watermark"].pop("font_data", None)  # never store blobs in Mongo
+        settings = normalize_settings(await get_user_settings(user_id))
+        settings["watermark"].pop("font_data", None)
         saved = await update_user_settings(user_id, settings)
+        if not saved:
+            try:
+                os.remove(final_font_path)
+            except OSError:
+                pass
 
         if saved:
-            await callback_query.answer("✅ Custom font saved", show_alert=False)
+            await _safe_callback_answer(callback_query, "✅ Custom font saved", show_alert=False
+            )
         else:
-            await callback_query.answer("⚠️ Could not save — try again.", show_alert=True)
+            await _safe_callback_answer(callback_query, "⚠️ Could not save — try again.", show_alert=True
+            )
 
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
     except ListenerTimeout:
-        await callback_query.answer("⏰ Timed out — try again.", show_alert=True)
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
         try:
             callback_query.data = "set_watermark"
             await watermark_callback(client, callback_query)
@@ -1320,6 +1804,12 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
              await watermark_callback(client, callback_query)
              return
         log.error(f"WM Font Upload Error: {e}")
+        temp_font_path = locals().get("temp_font_path")
+        if temp_font_path and os.path.isfile(temp_font_path):
+            try:
+                os.remove(temp_font_path)
+            except OSError:
+                pass
         try:
             await prompt_msg.delete()
         except Exception:
@@ -1332,148 +1822,272 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
     await watermark_callback(client, callback_query)
 
 
-@Client.on_callback_query(filters.regex("^wm_timing_tutorial"))
+@Client.on_callback_query(
+    filters.regex("^wm_timing_tutorial") & filters.private
+)
 async def wm_timing_tutorial_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    if await is_banned(user_id):
+        await _safe_callback_answer(callback_query, "You are banned from using this bot.", show_alert=True)
+        return
+    await _safe_callback_answer(callback_query)
     text = "<b>1. Range mode</b>\n<blockquote>Show only between two times.\n• Format: <code>start end</code>\n• Example: <code>10 60</code> → visible from 10s to 60s</blockquote>\n\n<b>2. Interval mode</b>\n<blockquote>Flash periodically.\n• Format: <code>duration period</code>\n• Example: <code>5 30</code> → on for 5s, every 30s\n• Windows: 0–5s, 30–35s, 60–65s…</blockquote>\n\n<b>3. Always</b>\n<blockquote>Watermark stays visible the whole time.</blockquote>"
-    await callback_query.message.edit_text(
-        text=text,
-        reply_markup=InlineKeyboardMarkup([[back_btn("set_watermark")]])
+    await _edit_panel(
+        callback_query.message,
+        text,
+        InlineKeyboardMarkup([[back_btn("set_watermark")]]),
     )
 
 
-@Client.on_callback_query(filters.regex("^cancel_input"))
+@Client.on_callback_query(filters.regex("^cancel_input") & filters.private)
 async def cancel_input_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    try:
-        # Try stopping the listener
-        await client.stop_listening(chat_id=user_id)
-    except Exception as e:
-        log.error(f"Error stopping listener for {user_id}: {e}")
+    if not _owns_callback_message(callback_query):
+        await _safe_callback_answer(callback_query, "This panel belongs to another chat.", show_alert=True)
+        return
+    cancelled = await cancel_session(
+        client,
+        user_id,
+        message_id=callback_query.message.id,
+    )
+    if not cancelled:
+        # The prompt edit and listener registration are adjacent awaits;
+        # give a just-rendered prompt one event-loop turn to register.
+        await asyncio.sleep(0.05)
+        cancelled = await cancel_session(
+            client,
+            user_id,
+            message_id=callback_query.message.id,
+        )
+    if cancelled:
+        await _safe_callback_answer(callback_query, "🚫 Cancelled")
+    else:
+        await _safe_callback_answer(callback_query, "This prompt is no longer active.", show_alert=True
+        )
+        return
 
-    await callback_query.answer("🚫 Cancelled")
+    current_text = (
+        callback_query.message.text or callback_query.message.caption or ""
+    )
+    if "Upload thumbnail" in current_text:
+        callback_query.data = "set_thumbnail"
+        await thumbnail_callback(client, callback_query)
 
 
 # Invoked via delegation from settings_callback (the ^set_ handler owns
 # dispatch for all set_thumbnail* callback data).
 async def thumbnail_callback(client, callback_query):
     user_id = callback_query.from_user.id
-    settings = await get_user_settings(user_id)
-    if not settings:
-        settings = {}
-
+    settings = normalize_settings(await get_user_settings(user_id))
+    thumb = settings.get("thumbnail")
+    thumb_path_safe = isinstance(thumb, str) and _is_safe_asset_path(thumb, THUMB_DIR)
+    thumb_ready = bool(thumb) and (
+        isinstance(thumb, bytes)
+        or (thumb_path_safe and os.path.isfile(str(thumb)))
+    )
     data = callback_query.data
 
     if data == "set_thumbnail":
-        thumb_exists = "thumbnail" in settings
-        status = "✅ Set" if thumb_exists else "❌ Not set"
-
+        status = "✅ Ready" if thumb_ready else "❌ Not set"
         text = (
             f"{ICONS.thumb} <b>Custom thumbnail</b>\n\n"
-            f"<blockquote>Status: {status}</blockquote>\n"
-            f"Upload a custom thumbnail to embed in your finished videos."
+            f"<blockquote>Status: {status}</blockquote>"
+            "Upload a square image for the best result. It is attached to every "
+            "delivered Telegram variant; Telegram requires a fresh thumbnail "
+            "upload for each media send."
         )
-
-        buttons_list = [
-            [InlineKeyboardButton("📤 Upload New", callback_data="set_thumbnail_upload")],
-            [InlineKeyboardButton("🔙 Back", callback_data="set_main")]
-        ]
-
-        if thumb_exists:
-            buttons_list.insert(0, [
-                InlineKeyboardButton("👁️ View Current", callback_data="set_thumbnail_view"),
-                InlineKeyboardButton("🗑️ Delete", callback_data="set_thumbnail_delete")
-            ])
-
-        buttons = InlineKeyboardMarkup(buttons_list)
-        await callback_query.message.edit(text, reply_markup=buttons)
+        buttons = []
+        if thumb_ready:
+            buttons.append(
+                [
+                    btn("👁 View", "set_thumbnail_view"),
+                    btn("🗑 Delete", "set_thumbnail_delete"),
+                ]
+            )
+        buttons.extend(
+            [
+                [btn("📤 Upload or replace", "set_thumbnail_upload")],
+                [back_btn("set_main")],
+            ]
+        )
+        await _edit_panel(
+            callback_query.message, text, InlineKeyboardMarkup(buttons)
+        )
 
     elif data == "set_thumbnail_view":
-        if "thumbnail" not in settings:
-            await callback_query.answer("No thumbnail set.", show_alert=True)
+        if not thumb_ready:
+            await _safe_callback_answer(callback_query, "No usable thumbnail is set.", show_alert=True)
             return
-
-        # Save temp file to send
-        import io
-        thumb_data = settings["thumbnail"]
-        f = io.BytesIO(thumb_data)
-        f.name = "thumbnail.jpg"
-
+        temporary_path = None
+        normalized_path = None
         try:
-            await client.send_photo(
-                chat_id=user_id,
-                photo=f,
-                caption=f"{ICONS.thumb} <b>Your current thumbnail</b>"
+            if isinstance(thumb, bytes):
+                temporary_path = os.path.join(
+                    THUMB_DIR, f"legacy_{user_id}_{uuid.uuid4().hex[:8]}.jpg"
+                )
+                os.makedirs(THUMB_DIR, exist_ok=True)
+                with open(temporary_path, "wb") as handle:
+                    handle.write(thumb)
+                source_path = temporary_path
+            else:
+                if not thumb_path_safe:
+                    raise RuntimeError("thumbnail path is outside the managed asset directory")
+                source_path = str(thumb)
+
+            normalized_path = await prepare_telegram_thumbnail(
+                source_path,
+                destination=os.path.join(
+                    THUMB_DIR, f"view_{user_id}_{uuid.uuid4().hex[:8]}.jpg"
+                ),
             )
-            await callback_query.answer()
-        except Exception as e:
-            log.error(f"Failed to send thumbnail: {e}")
-            await callback_query.answer("Failed to send thumbnail.", show_alert=True)
+            caption = f"{ICONS.thumb} <b>Your current thumbnail</b>"
+            if normalized_path:
+                await client.send_photo(
+                    chat_id=user_id,
+                    photo=normalized_path,
+                    caption=caption,
+                )
+            else:
+                await client.send_document(
+                    chat_id=user_id,
+                    document=source_path,
+                    caption=caption,
+                )
+            await _safe_callback_answer(callback_query)
+        except Exception as exc:
+            log.error(f"Failed to send thumbnail: {exc}")
+            await _safe_callback_answer(callback_query, "Could not send thumbnail.", show_alert=True
+            )
+        finally:
+            for path in (temporary_path, normalized_path):
+                if path and os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
     elif data == "set_thumbnail_delete":
-        if "thumbnail" in settings:
-            del settings["thumbnail"]
-            await update_user_settings(user_id, settings)
-            await callback_query.answer("🗑 Thumbnail deleted", show_alert=False)
-
-            # Refresh menu
-            # Better to just trigger base menu logic again
+        if not thumb:
+            await _safe_callback_answer(callback_query, "No thumbnail to delete.", show_alert=True)
+            return
+        settings["thumbnail"] = None
+        saved = await update_user_settings(user_id, settings)
+        if saved and isinstance(thumb, str) and os.path.isfile(thumb):
+            try:
+                root = os.path.abspath(THUMB_DIR)
+                target = os.path.abspath(thumb)
+                if os.path.commonpath((root, target)) == root:
+                    os.remove(target)
+            except (OSError, ValueError) as exc:
+                log.warning(f"Could not remove thumbnail asset: {exc}")
+        await _safe_callback_answer(callback_query,
+            "🗑 Thumbnail deleted" if saved else "⚠️ Could not delete — try again.",
+            show_alert=not saved,
+        )
+        if saved:
             callback_query.data = "set_thumbnail"
             await thumbnail_callback(client, callback_query)
-        else:
-            await callback_query.answer("No thumbnail to delete.", show_alert=True)
 
     elif data == "set_thumbnail_upload":
-        await callback_query.message.edit(
-            "<b>📤 Upload thumbnail</b>\n\n"
-            "Send the photo you want embedded on finished videos.\n"
-            "<i>Max 5 MB · press Cancel to abort.</i>",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]
-            )
+        prompt_msg = await _edit_panel(
+            callback_query.message,
+            f"{ICONS.thumb} <b>Upload thumbnail</b>\n\n"
+            "<blockquote>JPG or PNG · maximum 5 MB</blockquote>"
+            "<i>Send a photo in this chat, or press Cancel.</i>",
+            InlineKeyboardMarkup([[back_btn("cancel_input")]]),
         )
-
-        # Listen for photo
         try:
-            input_msg = await client.listen(chat_id=user_id, filters=filters.photo, timeout=300)
-
-            photo = input_msg.photo
-            if getattr(photo, "file_size", 0) and photo.file_size > 5 * 1024 * 1024:
-                await callback_query.answer("❌ Image too large (max 5 MB).", show_alert=True)
+            input_msg = await listen_once(
+                client,
+                user_id,
+                prompt_msg.id,
+                "thumbnail:upload",
+                120,
+                filters=filters.photo | filters.document,
+            )
+            photo = input_msg.photo or input_msg.document
+            mime_type = str(getattr(photo, "mime_type", "") or "")
+            photo_name = str(getattr(photo, "file_name", "") or "")
+            if not input_msg.photo and not (
+                mime_type.startswith("image/")
+                or photo_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+            ):
+                await _safe_callback_answer(callback_query, "❌ Send a JPG, PNG, or WebP image.", show_alert=True
+                )
+                callback_query.data = "set_thumbnail"
+                await thumbnail_callback(client, callback_query)
+                return
+            if int(getattr(photo, "file_size", 0) or 0) > 5 * 1024 * 1024:
+                await _safe_callback_answer(callback_query,
+                    "❌ Image too large (max 5 MB).",
+                    show_alert=True,
+                )
+                callback_query.data = "set_thumbnail"
+                await thumbnail_callback(client, callback_query)
                 return
 
-            os.makedirs("thumbs", exist_ok=True)
-            file_path = await client.download_media(input_msg, file_name=f"thumbs/{user_id}.jpg")
-
-            if file_path and os.path.exists(file_path):
-                # Keep the file on disk under THUMB_DIR; store only the path
-                # (never raw image bytes in Mongo).
-                settings["thumbnail"] = file_path
-                settings.pop("thumbnail_data", None)
-                await update_user_settings(user_id, settings)
-
-                await input_msg.reply_text("<b>✅ Thumbnail saved!</b>")
-                await callback_query.answer()
-
-                # Return to menu
-                callback_query.data = "set_thumbnail"
-                await thumbnail_callback(client, callback_query)
-            else:
-                await input_msg.reply_text("❌ Failed to download the photo — please try again.")
-
-        except ListenerTimeout:
+            os.makedirs(THUMB_DIR, exist_ok=True)
+            final_path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
+            temp_path = os.path.join(
+                THUMB_DIR, f"{user_id}_{uuid.uuid4().hex[:8]}.upload"
+            )
+            file_path = await client.download_media(input_msg, file_name=temp_path)
+            if not file_path or not os.path.isfile(file_path):
+                raise RuntimeError("thumbnail download did not produce a file")
             try:
+                await input_msg.delete()
+            except Exception:
+                pass
+            normalized_path = await prepare_telegram_thumbnail(
+                file_path, destination=final_path
+            )
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            if not normalized_path:
+                raise RuntimeError(
+                    "thumbnail must be convertible to a square JPEG under 200 KB"
+                )
+
+            latest_settings = normalize_settings(await get_user_settings(user_id))
+            latest_settings["thumbnail"] = final_path
+            saved = await update_user_settings(user_id, latest_settings)
+            if not saved:
+                try:
+                    os.remove(final_path)
+                except OSError:
+                    pass
+            await _safe_callback_answer(callback_query,
+                "✅ Thumbnail saved" if saved else "⚠️ Could not save — try again.",
+                show_alert=not saved,
+            )
+            if saved:
                 callback_query.data = "set_thumbnail"
                 await thumbnail_callback(client, callback_query)
-            except Exception:
+        except ListenerBusy as exc:
+            await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+            return
+        except ListenerTimeout:
+            await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
+            callback_query.data = "set_thumbnail"
+            await thumbnail_callback(client, callback_query)
+        except Exception as exc:
+            if "ListenerCanceled" in str(exc) or isinstance(exc, asyncio.CancelledError):
+                return
+            log.error(f"Thumbnail upload error: {exc}", exc_info=True)
+            temp_path = locals().get("temp_path")
+            if temp_path and os.path.isfile(temp_path):
                 try:
-                    await callback_query.message.edit("⏰ Timeout — open <code>/settings</code> to try again.")
-                except Exception:
+                    os.remove(temp_path)
+                except OSError:
                     pass
-        except Exception as e:
-            if "ListenerCanceled" in str(e):
-                 await safe_edit(callback_query.message, "🚫 Cancelled.")
-            else:
-                log.error(f"Thumbnail upload error: {e}")
-                await safe_edit(callback_query.message, "❌ Something went wrong — try again.")
+            await _safe_callback_answer(callback_query, "❌ Could not save thumbnail.", show_alert=True
+            )
+            callback_query.data = "set_thumbnail"
+            await thumbnail_callback(client, callback_query)
 
 

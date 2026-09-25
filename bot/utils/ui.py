@@ -32,12 +32,22 @@ __all__ = [
     "success_card",
     "safe_edit",
     "truncate",
+    "progress_bar",
+    "state_label",
     "ICONS",
     "STANDARD_ACTIONS",
 ]
 
+class _IconMap(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
 # Canonical icons — use these instead of ad-hoc emoji per file.
-ICONS = {
+ICONS = _IconMap({
     "home": "🏠",
     "help": "📚",
     "settings": "⚙️",
@@ -72,7 +82,17 @@ ICONS = {
     "clock": "⏱️",
     "link": "🔗",
     "lock": "🔒",
-}
+    "profile": "🎛️",
+    "reset": "↺",
+    "bolt": "⚡",
+    "plus": "➕",
+    "minus": "➖",
+    "check": "✅",
+    "document": "📄",
+    "user": "👤",
+    "chevron_left": "⬅️",
+    "chevron_right": "➡️",
+})
 
 
 def btn(text: str, callback_data: Optional[str] = None, url: Optional[str] = None) -> InlineKeyboardButton:
@@ -180,6 +200,19 @@ def truncate(text: str, limit: int = 32) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "…"
+
+
+def progress_bar(percent: float, width: int = 20) -> str:
+    """Render one clamped progress bar for every transfer/encoding surface."""
+    percent = max(0.0, min(100.0, float(percent)))
+    width = max(4, int(width))
+    filled = int(percent / 100 * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def state_label(label: str, active: bool, active_icon: str = "✅") -> str:
+    """Add a consistent selected-state marker to inline button labels."""
+    return f"{active_icon} {label}" if active else label
 
 
 # Frequently reused full rows (keep navigation placement consistent).

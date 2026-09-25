@@ -5,14 +5,14 @@ import re
 import subprocess
 import sys
 
-UPSTREAM_BRANCH = os.environ.get("UPSTREAM_BRANCH", "main")
+UPDATE_COMMIT = os.environ.get("UPDATE_COMMIT", "")
 UPSTREAM_REPO = os.environ.get(
     "UPSTREAM_REPO",
     "https://github.com/Itzmepromgitman/ArgonsEncoder.git",
 )
 
-if not re.fullmatch(r"[A-Za-z0-9._/-]+", UPSTREAM_BRANCH):
-    print(f"Invalid UPSTREAM_BRANCH: {UPSTREAM_BRANCH!r}")
+if not re.fullmatch(r"[0-9a-fA-F]{40}", UPDATE_COMMIT):
+    print("UPDATE_COMMIT must be a full 40-character commit SHA when auto-update is enabled")
     sys.exit(1)
 
 
@@ -35,10 +35,8 @@ def main():
     results.append(run(["git", "add", "."]))
     results.append(run(["git", "commit", "-qsm", "update", "--no-verify"]))
     results.append(run(["git", "remote", "add", "origin", UPSTREAM_REPO]))
-    results.append(run(["git", "fetch", "origin", "-q"]))
-    results.append(
-        run(["git", "reset", "--hard", f"origin/{UPSTREAM_BRANCH}", "-q"])
-    )
+    results.append(run(["git", "fetch", "origin", UPDATE_COMMIT, "-q"]))
+    results.append(run(["git", "reset", "--hard", "FETCH_HEAD", "-q"]))
 
     reset_ok = all(r.returncode == 0 for r in results)
     if not reset_ok:

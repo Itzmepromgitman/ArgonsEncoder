@@ -1,5 +1,7 @@
 # Developed by ARGON telegram: @REACTIVEARGON
 import asyncio
+import uuid
+from html import escape
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -12,13 +14,14 @@ try:
 except ImportError:
     from asyncio import TimeoutError as ListenerTimeout
 
-from bot.config import OWNER_ID
+from bot.config import LOG_CHANNEL, OWNER_ID
 from bot.decorator import invalidate_user_caches, is_admin
 from bot.logger import LOGGER, send_logs
+from bot.utils.listener import ListenerBusy, listen_once
 from bot.utils.restart import restart_bot
 from bot.utils.shell import shell_command
-from bot.utils.ui import ICONS, close_btn, safe_edit
-from database import full_userbase, del_user, get_variable, set_variable
+from bot.utils.ui import ICONS, close_btn, progress_bar, safe_edit
+from database import forget_user_data, full_userbase, get_variable, set_variable
 
 log = LOGGER(__name__)
 
@@ -32,7 +35,9 @@ async def handle_restart(client, message):
         await restart_bot(client, message)
     except Exception as e:
         log.error(e)
-        await message.reply_text(f"❌ Restart failed: <code>{e}</code>")
+        await message.reply_text(
+            f"❌ Restart failed: <code>{escape(str(e))}</code>"
+        )
 
 
 @Client.on_message(filters.command("log") & filters.private)
@@ -74,7 +79,9 @@ async def ban_command(client, message):
         return
 
     banned.append(target)
-    await set_variable("banned_users", banned)
+    if not await set_variable("banned_users", banned):
+        await message.reply_text("⚠️ Could not save the ban — try again.")
+        return
     invalidate_user_caches()
     await message.reply_text(f"🚫 Banned <code>{target}</code>.")
 
@@ -100,7 +107,9 @@ async def unban_command(client, message):
         return
 
     banned.remove(target)
-    await set_variable("banned_users", banned)
+    if not await set_variable("banned_users", banned):
+        await message.reply_text("⚠️ Could not save the unban — try again.")
+        return
     invalidate_user_caches()
     await message.reply_text(f"✅ Unbanned <code>{target}</code>.")
 
@@ -112,7 +121,9 @@ async def maint_command(client, message):
 
     current = await get_variable("maintenance", False)
     new_state = not current
-    await set_variable("maintenance", new_state)
+    if not await set_variable("maintenance", new_state):
+        await message.reply_text("⚠️ Could not update maintenance mode.")
+        return
     if new_state:
         state_txt = (
             f"{ICONS.warn} <b>Maintenance enabled</b>\n"
@@ -129,18 +140,36 @@ async def maint_command(client, message):
 def _broadcast_status_card(total, successful, blocked, deleted, unsuccessful, done=False) -> str:
     title = "Broadcast completed" if done else "Broadcast in progress"
     icon = ICONS.success if done else ICONS.upload
+    processed = successful + blocked + deleted + unsuccessful
+    percent = (processed / total * 100) if total else (100 if done else 0)
     return (
         f"{icon} <b>{title}</b>\n"
-        f"<blockquote>👥 Total users: <code>{total}</code>\n"
-        f"✅ Successful: <code>{successful}</code>\n"
-        f"🚫 Blocked: <code>{blocked}</code>\n"
-        f"👻 Deactivated: <code>{deleted}</code>\n"
-        f"⚠️ Unsuccessful: <code>{unsuccessful}</code></blockquote>"
+        f"<blockquote><code>{progress_bar(percent, 16)}</code> <b>{percent:.1f}%</b>\n"
+        f"👥 Reached: <code>{processed:,}</code> / <code>{total:,}</code>\n"
+        f"✅ Sent: <code>{successful}</code> · 🚫 Blocked: <code>{blocked}</code>\n"
+        f"👻 Deactivated: <code>{deleted}</code> · ⚠️ Failed: <code>{unsuccessful}</code></blockquote>"
     )
+
+
+_broadcast_lock = asyncio.Lock()
+_active_broadcast_token: str | None = None
+_broadcast_stop_event: asyncio.Event | None = None
 
 
 @Client.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_command(client, message):
+    if _broadcast_lock.locked():
+        await message.reply_text(
+            "⏳ <b>Another broadcast is already running.</b>\n"
+            "<i>Wait for it to finish before starting another.</i>"
+        )
+        return
+    async with _broadcast_lock:
+        return await _broadcast_command_impl(client, message)
+
+
+async def _broadcast_command_impl(client, message):
+    global _active_broadcast_token, _broadcast_stop_event
     if not await is_admin(message.from_user.id):
         return
 
@@ -161,15 +190,27 @@ async def broadcast_command(client, message):
     total = 0
     edit = 0
 
+    broadcast_token = uuid.uuid4().hex[:16]
     pls_wait = await message.reply(
         "<b>📣 Broadcast setup</b>\n<blockquote>Choose how to deliver this message.</blockquote>",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("📢 Normal", callback_data="broadcast_normal"),
-                    InlineKeyboardButton("📌 Pin", callback_data="broadcast_pin"),
+                    InlineKeyboardButton(
+                        "📢 Normal",
+                        callback_data=f"broadcast_normal:{broadcast_token}",
+                    ),
+                    InlineKeyboardButton(
+                        "📌 Pin in log channel",
+                        callback_data=f"broadcast_pin:{broadcast_token}",
+                    ),
                 ],
-                [close_btn("Cancel")],
+                [
+                    InlineKeyboardButton(
+                        "Cancel",
+                        callback_data=f"broadcast_cancel:{broadcast_token}",
+                    )
+                ],
             ]
         ),
     )
@@ -177,7 +218,12 @@ async def broadcast_command(client, message):
     try:
         callback = await client.wait_for_callback_query(
             chat_id=message.chat.id,
-            filters=filters.user(message.from_user.id),
+            filters=(
+                filters.regex(
+                    rf"^broadcast_(normal|pin|cancel):{broadcast_token}$"
+                )
+                & filters.user(message.from_user.id)
+            ),
             timeout=30,
         )
     except asyncio.TimeoutError:
@@ -186,33 +232,56 @@ async def broadcast_command(client, message):
 
     await callback.answer()
 
-    pin = 1 if callback.data == "broadcast_pin" else 0
+    if callback.data.startswith("broadcast_cancel:"):
+        try:
+            await pls_wait.delete()
+        except Exception:
+            pass
+        return
+
+    pin = 1 if callback.data.startswith("broadcast_pin:") else 0
+    _active_broadcast_token = broadcast_token
+    _broadcast_stop_event = asyncio.Event()
+    stop_event = _broadcast_stop_event
+    broadcast_markup = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "⏹ Stop broadcast",
+                callback_data=f"broadcast_stop:{broadcast_token}",
+            ),
+            close_btn("Hide"),
+        ]]
+    )
     await pls_wait.edit(
         _broadcast_status_card(len(query), 0, 0, 0, 0),
-        reply_markup=InlineKeyboardMarkup([[close_btn("Hide")]]),
+        reply_markup=broadcast_markup,
     )
 
+    stopped = False
     for chat_id in query:
+        if stop_event.is_set():
+            stopped = True
+            break
         try:
-            sent = await broadcast_msg.copy(chat_id)
+            await broadcast_msg.copy(chat_id)
             successful += 1
-            if pin:
-                try:
-                    await sent.pin(both_sides=True)
-                except Exception:
-                    pass
         except FloodWait as e:
-            await asyncio.sleep(e.value)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=e.value)
+                stopped = True
+                break
+            except asyncio.TimeoutError:
+                pass
             try:
                 sent = await broadcast_msg.copy(chat_id)
                 successful += 1
             except Exception:
                 unsuccessful += 1
         except UserIsBlocked:
-            await del_user(chat_id)
+            await forget_user_data(chat_id)
             blocked += 1
         except InputUserDeactivated:
-            await del_user(chat_id)
+            await forget_user_data(chat_id)
             deleted += 1
         except Exception:
             unsuccessful += 1
@@ -223,27 +292,57 @@ async def broadcast_command(client, message):
             edit = 0
             try:
                 await pls_wait.edit_text(
-                    _broadcast_status_card(total, successful, blocked, deleted, unsuccessful)
+                    _broadcast_status_card(total, successful, blocked, deleted, unsuccessful),
+                    reply_markup=broadcast_markup,
                 )
             except Exception:
                 pass
 
-    await pls_wait.edit_text(
-        _broadcast_status_card(total, successful, blocked, deleted, unsuccessful, done=True),
-        reply_markup=InlineKeyboardMarkup([[close_btn("Close")]]),
+    if pin and not stopped:
+        try:
+            pinned = await broadcast_msg.copy(LOG_CHANNEL)
+            await pinned.pin(disable_notification=True)
+        except Exception as exc:
+            log.warning(f"Could not pin broadcast in log channel: {exc}")
+
+    final_text = _broadcast_status_card(
+        total, successful, blocked, deleted, unsuccessful, done=True
     )
+    if stopped:
+        final_text += "\n\n⏹ <b>Broadcast stopped by the operator.</b>"
+    try:
+        await pls_wait.edit_text(
+            final_text,
+            reply_markup=InlineKeyboardMarkup([[close_btn("Close")]]),
+        )
+    finally:
+        _active_broadcast_token = None
+        _broadcast_stop_event = None
 
 
-@Client.on_message(filters.command("admin") & filters.private)
-async def admin(client, message):
-    if message.from_user.id != OWNER_ID:
+@Client.on_callback_query(
+    filters.regex(r"^broadcast_stop:") & filters.private
+)
+async def broadcast_stop_callback(client, callback_query):
+    if not await is_admin(callback_query.from_user.id):
+        await callback_query.answer("Admin only.", show_alert=True)
         return
+    token = callback_query.data.split(":", 1)[1]
+    if token != _active_broadcast_token or _broadcast_stop_event is None:
+        await callback_query.answer("This broadcast is no longer active.", show_alert=True)
+        return
+    _broadcast_stop_event.set()
+    await callback_query.answer("⏹ Stopping after the current recipient…")
 
+
+async def _admin_panel_content():
     a = await get_variable("admin", [])
     admin_list = (
-        "\n".join(f"• <code>{x}</code>" for x in a) if a else "<i>No extra admins yet.</i>"
+        "\n".join(f"• <code>{escape(str(x))}</code>" for x in a)
+        if a
+        else "<i>No extra admins yet.</i>"
     )
-    txt = (
+    text = (
         f"{ICONS.admin} <b>Admin panel</b>\n\n"
         f"<blockquote><b>Admins</b>\n{admin_list}</blockquote>\n"
         f"<i>Admins can use bot commands except owner-only ops "
@@ -259,18 +358,30 @@ async def admin(client, message):
             [close_btn()],
         ]
     )
+    return text, keyboard
 
-    # Prefer editing an existing panel message when opened via Refresh.
-    if message.photo or (message.caption and "Admin panel" in (message.caption or "")):
+
+@Client.on_message(filters.command("admin") & filters.private)
+async def admin(client, message, owner_id: int | None = None):
+    if owner_id is None:
+        owner_id = getattr(getattr(message, "from_user", None), "id", None)
+    if owner_id != OWNER_ID:
+        return
+
+    text, keyboard = await _admin_panel_content()
+    if getattr(message, "photo", None) or (
+        getattr(message, "caption", None)
+        and "Admin panel" in (message.caption or "")
+    ):
         try:
-            await message.edit_caption(caption=txt, reply_markup=keyboard)
+            await message.edit_caption(caption=text, reply_markup=keyboard)
             return
         except Exception:
             pass
-    if await safe_edit(message, txt, keyboard):
+    if await safe_edit(message, text, keyboard):
         return
 
-    await message.reply_text(txt, reply_markup=keyboard)
+    await message.reply_text(text, reply_markup=keyboard)
 
 
 async def _parse_target_input(a):
@@ -278,7 +389,7 @@ async def _parse_target_input(a):
     if a.forward_from:
         return a.forward_from.id, None
     if a.forward_from_chat:
-        return a.forward_from_chat.id, None
+        return None, "Forwarded channel posts cannot identify a user. Forward a message from the user instead."
     if not a.text:
         return None, "Please send a valid user ID (text or forward)."
     try:
@@ -304,7 +415,7 @@ REM_ADMIN_PROMPT = (
 )
 
 
-@Client.on_callback_query(filters.regex("^admin_"))
+@Client.on_callback_query(filters.regex("^admin_") & filters.private)
 async def admin2(client, query):
     uid = query.from_user.id
 
@@ -316,7 +427,7 @@ async def admin2(client, query):
 
     if action == "refresh":
         await query.answer()
-        await admin(client, query.message)
+        await admin(client, query.message, owner_id=OWNER_ID)
         return
 
     if action not in ("add", "rem"):
@@ -324,14 +435,21 @@ async def admin2(client, query):
         return
 
     txt = ADD_ADMIN_PROMPT if action == "add" else REM_ADMIN_PROMPT
+    await query.answer("Waiting for the target user…")
 
     while True:
         b = await client.send_message(
             uid,
-            text=txt + "\n<i>Send a user ID, username, or forward a message. Send /cancel to abort.</i>",
+            text=txt + "\n<i>Send a numeric user ID or forward a message from the user. Send /cancel to abort.</i>",
         )
         try:
-            a = await client.listen(chat_id=uid, timeout=30)
+            a = await listen_once(
+                client, uid, b.id, f"admin:{action}", 30
+            )
+        except ListenerBusy as exc:
+            await client.send_message(uid, f"⚠️ {exc}")
+            await b.delete()
+            break
         except ListenerTimeout:
             await client.send_message(
                 chat_id=uid,
@@ -369,7 +487,11 @@ async def admin2(client, query):
                 continue
             admin1.remove(chat_id)
 
-        await set_variable("admin", admin1)
+        saved = await set_variable("admin", admin1)
+        if not saved:
+            await client.send_message(uid, "⚠️ Could not save the admin list — try again.")
+            await b.delete()
+            break
         invalidate_user_caches()
         await b.delete()
 
@@ -384,13 +506,10 @@ async def admin2(client, query):
             await query.message.delete()
         except Exception:
             pass
-        # Build a synthetic message-like call: re-send the panel.
-        class _M:
-            def __init__(self, chat_id):
-                self.chat = type("C", (), {"id": chat_id})()
-                self.photo = None
-                self.caption = None
-            async def reply_text(self, text, reply_markup=None):
-                return await client.send_message(chat_id, text, reply_markup=reply_markup)
-        await admin(client, _M(uid))
+        panel_text, panel_keyboard = await _admin_panel_content()
+        await client.send_message(
+            uid,
+            panel_text,
+            reply_markup=panel_keyboard,
+        )
         break

@@ -1,3 +1,5 @@
+import shlex
+
 from bot.func.ffmpeg_utils import (
     escape_drawtext,
     generate_ffmpeg_cmd,
@@ -110,12 +112,12 @@ def test_remux_stream_copy_skips_filters():
     assert "-crf" not in cmd
 
 
-def test_thumbnail_second_input_and_map():
+def test_custom_thumbnail_is_delivery_only_not_an_encoded_stream():
     cmds = generate_ffmpeg_cmd(_settings(), "/a.mkv", "/b", thumbnail_path="/t.jpg")
     cmd = cmds[0]["cmd"]
-    assert "-i /t.jpg" in cmd
-    assert "-map 1" in cmd
-    assert "attached_pic" in cmd
+    assert "/t.jpg" not in cmd
+    assert "-map 1" not in cmd
+    assert "attached_pic" not in cmd
 
 
 def test_escape_drawtext():
@@ -136,7 +138,35 @@ def test_sanitize_custom_name():
 
 
 def test_validate_ffmpeg_command():
-    assert validate_ffmpeg_command("-c:v libx264 -crf 23") is True
+    assert validate_ffmpeg_command("-crf 23 -preset fast") is True
     assert validate_ffmpeg_command("-i something") is False
     assert validate_ffmpeg_command("-y") is False
     assert validate_ffmpeg_command("   ") is False
+    assert validate_ffmpeg_command("-attach /etc/passwd") is False
+    assert validate_ffmpeg_command("-i pipe:0") is False
+    assert validate_ffmpeg_command("-map 0:v:0 1:v:0") is False
+    assert validate_ffmpeg_command("-filter_complex movie=file:///etc/passwd") is False
+    assert validate_ffmpeg_command("-metadata title=hello -preset fast") is True
+    assert validate_ffmpeg_command("-crf 23 -preset fast") is True
+    assert validate_ffmpeg_command("-threads 64 -r 1000000 -b:v 100M") is False
+    assert validate_ffmpeg_command("-an -sn -dn") is False
+    assert validate_ffmpeg_command("-c:v libx264") is False
+    assert validate_ffmpeg_command("-c:v copy") is False
+
+
+def test_audio_track_numbers_are_one_based():
+    settings = _settings()
+    settings["audio"]["track"] = "1"
+    cmd = generate_ffmpeg_cmd(settings, "/a", "/b")[0]["cmd"]
+    args = shlex.split(cmd)
+    assert "0:a:0?" in args
+    assert "0:a:1?" not in args
+
+
+def test_mp4_uses_streamable_subtitle_codec():
+    settings = _settings()
+    settings["output_as_video"] = True
+    cmd = generate_ffmpeg_cmd(settings, "/a", "/b")[0]["cmd"]
+    assert "-movflags +faststart" in cmd
+    assert "-c:s mov_text" in cmd
+    assert generate_ffmpeg_cmd(settings, "/a", "/b")[0]["output_file"] == "/b.mp4"

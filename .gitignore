@@ -11,6 +11,8 @@ logs/
 downloads/
 watermarks/
 thumbs/
+.privacy-markers/
+.argons-privacy/
 *.session
 *.session-journal
 
