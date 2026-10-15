@@ -24,7 +24,7 @@ from ui_snapshot_utils import SURFACES, build_surface  # noqa: E402
 
 MAX_TEXT_LEN = 1024
 MAX_CALLBACK_BYTES = 64
-NAV_WORDS = ("home", "back", "close", "✖", "↩", "🏠", "❌")
+NAV_WORDS = ("home", "back", "close", "cancel", "✖", "↩", "🏠", "❌")
 NAV_CALLBACKS = {"cb_start", "cb_open_settings", "set_main", "close", "cancel"}
 
 

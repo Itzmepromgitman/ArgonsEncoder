@@ -6,8 +6,8 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.logger import LOGGER
+from bot.utils import progress_card
 from bot.utils.format import TimeFormatter, humanbytes
-from bot.utils.ui import progress_bar
 
 log = LOGGER(__name__)
 
@@ -48,10 +48,7 @@ async def progress_for_pyrogram(
     diff = now - start
 
     if now - last_time >= 3 or current == total:
-        if total == 0:
-            percentage = 0
-        else:
-            percentage = current * 100 / total
+        percentage = 0 if total == 0 else current * 100 / total
 
         speed = current / diff if diff > 0 else 0
         elapsed_time = round(diff) * 1000
@@ -59,26 +56,22 @@ async def progress_for_pyrogram(
         estimated_total_time = elapsed_time + time_to_completion
 
         elapsed_time_str = TimeFormatter(elapsed_time)
-        estimated_total_time_str = TimeFormatter(estimated_total_time) if estimated_total_time else "calculating…"
+        estimated_total_time_str = (
+            TimeFormatter(estimated_total_time)
+            if estimated_total_time
+            else "calculating…"
+        )
 
-        progress_bar_text = progress_bar(percentage, width=20)
-
-        if percentage == 100:
-            status_emoji = "✅"
-        elif percentage >= 75:
-            status_emoji = "🔥"
-        elif percentage >= 50:
-            status_emoji = "⏳"
-        elif percentage >= 25:
-            status_emoji = "🚀"
-        else:
-            status_emoji = "▶️"
-
-        progress_text = (
-            f"{status_emoji} <b>{ud_type}</b>\n"
-            f"<blockquote><code>{progress_bar_text}</code> <b>{percentage:.1f}%</b>\n"
-            f"📦 {humanbytes(current)} / {humanbytes(total)}\n"
-            f"⚡ {humanbytes(speed)}/s · ⏱ {elapsed_time_str} · ⏳ ETA {estimated_total_time_str}</blockquote>"
+        progress_text = progress_card.card(
+            title=ud_type,
+            percent=percentage,
+            size_text=progress_card.size_line(current, total),
+            timing_text=progress_card.timing_line(
+                f"{humanbytes(speed)}/s",
+                elapsed_time_str,
+                estimated_total_time_str,
+            ),
+            stage=progress_card.transfer_stage(ud_type),
         )
 
         _progress_state[unique_id] = now

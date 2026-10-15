@@ -12,6 +12,7 @@ document.
 | `bot/__main__.py` | Process entry point: client bootstrap, plugin loading, shutdown. |
 | `bot/utils/ui.py` | Shared design system: `ICONS`, `btn`, `back_btn`, `close_btn`, `card`, `error_card`, `empty_state`, `safe_edit`, `progress_bar`, `truncate`, `state_label`. |
 | `bot/utils/callback_ui.py` | Exactly-once callback answering (`answer_once`, `guard_callback_answers`). |
+| `bot/utils/progress_card.py` | Shared progress skeleton: headline, pipeline stage chips, bar + percent, size, timing. |
 | `bot/utils/settings.py` | `normalize_settings` and range/default validation for user settings. |
 | `bot/utils/format.py` | `humanbytes`, `format_time`. |
 | `bot/utils/listener.py` | `listen_once` / `cancel_session` input prompts with a busy guard. |
@@ -43,6 +44,21 @@ and drop any confirmation that followed.
 
 Handlers in `plugins/settings.py` keep their existing `_safe_callback_answer`
 helper; it now delegates to `answer_once`, so call sites are unchanged.
+
+## Progress model
+
+Every progress surface (encode, upload, download) renders through
+`bot/utils/progress_card.py` so the three read as one product:
+
+- `stage_chips(stage)` — the pipeline `Queued › Downloading › Encoding ›
+  Delivering › Done`, with done/active/pending markers.
+- `headline`, `size_line`, `timing_line`, `progress_block` — the shared line
+  grammar.
+- `card(...)` — assembles headline, chips, optional subtitle, the blockquote
+  block, and optional footer blocks.
+
+`FFmpegProcess.get_progress_ui` (`bot/func/encode.py`) and
+`progress_for_pyrogram` (`bot/func/pyroutils/progress.py`) both call `card`.
 
 ## Testing tiers
 

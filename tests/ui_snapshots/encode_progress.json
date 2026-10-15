@@ -1,0 +1,22 @@
+{
+  "surface": "encode_progress",
+  "text": "<b>🎬 Encoding</b> · Step 1/2\n✅Queued › ✅Downloading › ▶️Encoding › ○Delivering › ○Done\n📁 <code>clip.mp4</code>\n<blockquote><code>▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱</code> <b>42.5%</b>\n📦 0 B / 10.00 MB\n⚡ 2.3x · ⏱ 00:12 · ⏳ ETA 00:31\n🎞 30.0 fps · 📊 1234kb/s</blockquote>\n<blockquote>⚙️ <code>libx264</code> · CRF <code>23</code> · medium · 1080p\n🆔 <code>abc123</code></blockquote>",
+  "rows": [
+    [
+      {
+        "text": "⏸ Pause",
+        "callback_data": "enc_pause_abc123"
+      },
+      {
+        "text": "❌ Cancel",
+        "callback_data": "enc_cancel_abc123"
+      }
+    ],
+    [
+      {
+        "text": "📋 Queue",
+        "callback_data": "enc_queue_abc123"
+      }
+    ]
+  ]
+}

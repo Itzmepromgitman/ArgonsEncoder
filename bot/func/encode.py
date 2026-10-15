@@ -46,8 +46,9 @@ from bot.func.pyroutils.progress import (
 from bot.func.queue_manager import queue_manager
 from bot.func.upload_manager import upload_manager
 from bot.logger import LOGGER
+from bot.utils import progress_card
 from bot.utils.settings import normalize_settings
-from bot.utils.ui import ICONS, progress_bar
+from bot.utils.ui import ICONS
 from database import get_user_settings, inc_stats
 
 log = LOGGER(__name__)
@@ -955,8 +956,6 @@ class FFmpegProcess:
             pass
 
     def get_progress_ui(self) -> str:
-        bar = progress_bar(self.stats.percent, width=20)
-
         current_size = 0
         try:
             current_size = os.path.getsize(self.output_file)
@@ -987,16 +986,25 @@ class FFmpegProcess:
         else:
             status_icon, status_text = "🎬", "Encoding"
 
-        return (
-            f"{status_icon} <b>{status_text}</b>{step_info}\n"
-            f"📁 <code>{escape(self.file_name)}</code>\n"
-            f"<blockquote><code>{bar}</code> <b>{self.stats.percent:.1f}%</b>\n"
-            f"📦 {humanbytes(current_size)} / {humanbytes(self.original_size)}{comp_text}\n"
-            f"⏳ ETA <b>{self.stats.eta}</b> · ⏱ {self.stats.elapsed}\n"
-            f"⚡ {self.stats.speed} · 🎞 {self.stats.fps:.1f} fps · 📊 {self.stats.bitrate}</blockquote>\n"
-            f"<blockquote>⚙️ <code>{escape(str(self.codec))}</code> · CRF <code>{escape(str(self.crf))}</code> · "
-            f"{escape(str(self.preset))} · {escape(str(self.resolution))}\n"
-            f"🆔 <code>{self.job_id}</code></blockquote>"
+        return progress_card.card(
+            title=f"{status_icon} {status_text}",
+            step_info=step_info,
+            stage="Encoding",
+            subtitle=f"📁 <code>{escape(self.file_name)}</code>",
+            percent=self.stats.percent,
+            size_text=progress_card.size_line(
+                current_size, self.original_size, comp_text
+            ),
+            timing_text=progress_card.timing_line(
+                self.stats.speed, self.stats.elapsed, self.stats.eta
+            ),
+            extra_lines=[f"🎞 {self.stats.fps:.1f} fps · 📊 {self.stats.bitrate}"],
+            footer_lines=[
+                f"<blockquote>⚙️ <code>{escape(str(self.codec))}</code> · "
+                f"CRF <code>{escape(str(self.crf))}</code> · "
+                f"{escape(str(self.preset))} · {escape(str(self.resolution))}\n"
+                f"🆔 <code>{self.job_id}</code></blockquote>"
+            ],
         )
 
 

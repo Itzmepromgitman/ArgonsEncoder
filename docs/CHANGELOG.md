@@ -4,6 +4,27 @@ All notable changes to Argons Encoder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version is
 exposed to users through `BOT_VERSION` (see the About panel).
 
+## [2.4.0] - 2026-10-15
+
+### Added
+- **Pipeline stage chips on every progress card** (`Queued › Downloading ›
+  Encoding › Delivering › Done`) so users can see where a job is, not just how
+  far it has gone.
+- `bot/utils/progress_card.py`: one shared progress skeleton (headline, stage
+  chips, bar + percent, size, timing, metrics).
+- Snapshot surfaces `encode_progress` and `transfer_progress`; the UI audit now
+  covers three surfaces.
+
+### Changed
+- The encode card (`bot/func/encode.py::get_progress_ui`) and the transfer card
+  (`bot/func/pyroutils/progress.py::progress_for_pyrogram`) now render through
+  the same skeleton with the same `Value · Value · Value` line format. The
+  transfer card no longer double-stamps an icon (title + percentage emoji).
+
+### Fixed
+- `progress_card.headline` clamps the displayed percentage to 0–100 so an
+  out-of-range value can never print "150.0%".
+
 ## [2.3.1] - 2026-10-15
 
 ### Fixed

@@ -1,0 +1,12 @@
+{
+  "surface": "transfer_progress",
+  "text": "<b>📥 Downloading...</b>\n✅Queued › ▶️Downloading › ○Encoding › ○Delivering › ○Done\n<blockquote><code>▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱</code> <b>42.5%</b>\n📦 4.25 MB / 10.00 MB\n⚡ 1.2 MiB/s · ⏱ 00:12 · ⏳ ETA 00:16</blockquote>",
+  "rows": [
+    [
+      {
+        "text": "❌ Cancel",
+        "callback_data": "cb_xfer_cancel"
+      }
+    ]
+  ]
+}
