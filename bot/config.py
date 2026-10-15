@@ -16,7 +16,7 @@ OWNER = os.environ.get("OWNER", "YOUR_OWNER_USERNAME_OR_ID")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1234567890"))
 PORT = os.environ.get("PORT", "8030")
 BOT_NAME = os.environ.get("BOT_NAME", "Argons Encoder")
-BOT_VERSION = os.environ.get("BOT_VERSION", "2.3.0")
+BOT_VERSION = os.environ.get("BOT_VERSION", "2.3.1")
 
 # --- Database ---
 DB_URI = os.environ.get(

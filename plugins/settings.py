@@ -25,6 +25,7 @@ from bot.func.ffmpeg_utils import (
 )
 from bot.func.media import prepare_telegram_thumbnail
 from bot.logger import LOGGER
+from bot.utils.callback_ui import answer_once, guard_callback_answers
 from bot.utils.listener import ListenerBusy, cancel_session, listen_once
 from bot.utils.settings import (
     QUALITY_PRESETS,
@@ -53,11 +54,13 @@ def _owns_callback_message(callback_query) -> bool:
 
 
 async def _safe_callback_answer(callback_query, text=None, show_alert=False):
-    """Answer immediately when possible; late listener replies must not crash."""
-    try:
-        await callback_query.answer(text, show_alert=show_alert)
-    except Exception as exc:
-        log.debug(f"Callback answer was no longer available: {exc}")
+    """Answer each callback query exactly once, preferring the informative text.
+
+    Delegates to :func:`bot.utils.callback_ui.answer_once` so the first empty
+    "stop the spinner" answer is deferred and replaced by the real confirmation
+    or error instead of being dropped by Telegram as a duplicate answer.
+    """
+    await answer_once(callback_query, text, show_alert)
 
 
 async def _edit_panel(message, text, reply_markup=None):
@@ -137,14 +140,8 @@ async def settings_command(client, message, query=False, user_id=None):
     await render_settings_menu(client, message, query=query, user_id=target_user_id)
 
 
-async def render_settings_menu(client, message, query: bool = False, user_id: int = None):
-    """Shared entry point for /settings and the cb_open_settings button."""
-    if user_id is None:
-        user_id = message.chat.id
-    if await is_user_tombstoned(user_id):
-        return
-
-    settings = normalize_settings(await get_user_settings(user_id))
+def settings_menu_card(settings):
+    """Pure builder for the settings main menu; returns ``(text, keyboard)``."""
     video = settings["video"]
     audio = settings["audio"]
     resolutions = ", ".join(video["resolution"])
@@ -205,6 +202,18 @@ async def render_settings_menu(client, message, query: bool = False, user_id: in
             [btn(f"{ICONS.reset} Reset", "reset_confirm"), close_btn()],
         ]
     )
+    return text, buttons
+
+
+async def render_settings_menu(client, message, query: bool = False, user_id: int = None):
+    """Shared entry point for /settings and the cb_open_settings button."""
+    if user_id is None:
+        user_id = message.chat.id
+    if await is_user_tombstoned(user_id):
+        return
+
+    settings = normalize_settings(await get_user_settings(user_id))
+    text, buttons = settings_menu_card(settings)
 
     if query:
         edited = await _edit_panel(message, text, buttons)
@@ -218,6 +227,7 @@ async def render_settings_menu(client, message, query: bool = False, user_id: in
 
 
 @Client.on_callback_query(filters.regex(r"^(set_|use_profile_|reset_)") & filters.private)
+@guard_callback_answers
 async def settings_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -524,6 +534,7 @@ async def settings_callback(client, callback_query: CallbackQuery):
     filters.regex(r"^(toggle_video_remux|toggle_video_subs|toggle_output_mode)$")
     & filters.private
 )
+@guard_callback_answers
 async def toggle_simple_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -580,6 +591,7 @@ async def toggle_simple_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^edit_") & filters.private)
+@guard_callback_answers
 async def edit_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -831,6 +843,7 @@ async def edit_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^toggle_res_") & filters.private)
+@guard_callback_answers
 async def toggle_res_callback(client, callback_query: CallbackQuery):
     res = callback_query.data.replace("toggle_res_", "")
     user_id = callback_query.from_user.id
@@ -867,6 +880,7 @@ async def toggle_res_callback(client, callback_query: CallbackQuery):
     await edit_callback(client, callback_query)
 
 @Client.on_callback_query(filters.regex("^add_custom") & filters.private)
+@guard_callback_answers
 async def add_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
@@ -1008,6 +1022,7 @@ async def add_custom_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^del_custom_") & filters.private)
+@guard_callback_answers
 async def del_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     name = callback_query.data.replace("del_custom_", "")
@@ -1037,6 +1052,7 @@ async def del_custom_callback(client, callback_query: CallbackQuery):
 @Client.on_callback_query(
     filters.regex(r"^(toggle_active_custom|use_custom_)") & filters.private
 )
+@guard_callback_answers
 async def active_custom_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
@@ -1077,6 +1093,7 @@ async def active_custom_callback(client, callback_query: CallbackQuery):
 @Client.on_callback_query(
     filters.regex("^wm_(toggle|select|set|preview)") & filters.private
 )
+@guard_callback_answers
 async def watermark_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -1330,6 +1347,7 @@ async def watermark_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^wm_edit_") & filters.private)
+@guard_callback_answers
 async def wm_edit_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -1478,6 +1496,7 @@ async def wm_edit_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^wm_upload_img") & filters.private)
+@guard_callback_answers
 async def wm_upload_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
@@ -1599,6 +1618,7 @@ async def wm_upload_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^wm_config_timing") & filters.private)
+@guard_callback_answers
 async def wm_timing_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
@@ -1704,6 +1724,7 @@ async def wm_timing_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^wm_upload_font") & filters.private)
+@guard_callback_answers
 async def wm_upload_font_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     message = callback_query.message
@@ -1825,6 +1846,7 @@ async def wm_upload_font_callback(client, callback_query: CallbackQuery):
 @Client.on_callback_query(
     filters.regex("^wm_timing_tutorial") & filters.private
 )
+@guard_callback_answers
 async def wm_timing_tutorial_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if not _owns_callback_message(callback_query):
@@ -1843,6 +1865,7 @@ async def wm_timing_tutorial_callback(client, callback_query: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex("^cancel_input") & filters.private)
+@guard_callback_answers
 async def cancel_input_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if not _owns_callback_message(callback_query):
@@ -1879,6 +1902,7 @@ async def cancel_input_callback(client, callback_query: CallbackQuery):
 
 # Invoked via delegation from settings_callback (the ^set_ handler owns
 # dispatch for all set_thumbnail* callback data).
+@guard_callback_answers
 async def thumbnail_callback(client, callback_query):
     user_id = callback_query.from_user.id
     settings = normalize_settings(await get_user_settings(user_id))

@@ -1,0 +1,56 @@
+{
+  "surface": "settings_menu",
+  "text": "⚙️ <b>Encoding settings</b>\n\n<blockquote>🎛 Custom · libx264 · CRF <code>23</code> · medium\n📐 1080p · Full video · 🎞 Re-encode</blockquote>\n<blockquote>🎵 aac 128k · track all\n💬 Subtitles: copy · 📄 Document</blockquote>\n<blockquote>💧 Off · 🖼️ Not set · ✂️ Off\n🛠 Custom override: <code>None</code></blockquote>\n<i>Changes save instantly. Presets only alter encoding quality.</i>",
+  "rows": [
+    [
+      {
+        "text": "🎬 Video",
+        "callback_data": "set_video"
+      },
+      {
+        "text": "🎵 Audio",
+        "callback_data": "set_audio"
+      }
+    ],
+    [
+      {
+        "text": "💧 Watermark",
+        "callback_data": "set_watermark"
+      },
+      {
+        "text": "🖼️ Thumbnail",
+        "callback_data": "set_thumbnail"
+      }
+    ],
+    [
+      {
+        "text": "📦 Output & more",
+        "callback_data": "set_more"
+      },
+      {
+        "text": "📝 Metadata",
+        "callback_data": "set_meta"
+      }
+    ],
+    [
+      {
+        "text": "🎛️ Presets",
+        "callback_data": "set_profiles"
+      },
+      {
+        "text": "🛠 Advanced",
+        "callback_data": "set_custom"
+      }
+    ],
+    [
+      {
+        "text": "↺ Reset",
+        "callback_data": "reset_confirm"
+      },
+      {
+        "text": "❌ Close",
+        "callback_data": "cb_close"
+      }
+    ]
+  ]
+}

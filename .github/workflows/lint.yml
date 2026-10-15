@@ -26,6 +26,11 @@ jobs:
       - name: Ruff (undefined names + real errors)
         run: ruff check . --select E9,F63,F7,F81,F82,F821,F822,F823,F401
 
+      - name: UI audit (surface invariants)
+        run: |
+          export TG_BOT_TOKEN=test APP_ID=1 API_HASH=test DATABASE_URL="mongodb://localhost:27017"
+          python scripts/ui_audit.py
+
       - name: Unit tests
         run: |
           export TG_BOT_TOKEN=test APP_ID=1 API_HASH=test DATABASE_URL="mongodb://localhost:27017"
