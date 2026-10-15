@@ -4,6 +4,30 @@ All notable changes to Argons Encoder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version is
 exposed to users through `BOT_VERSION` (see the About panel).
 
+## [2.5.0] - 2026-10-15
+
+### Added
+- **Named encoding presets** (`bot/utils/presets.py`, `bot/utils/settings.py`):
+  four built-ins (🌐 Web 1080p, 📱 Social 720p, 📦 Compact 480p, 🪶 Tiny 360p)
+  plus up to 12 user-saved presets. A preset is an overlay over the encoding
+  knobs only, so applying one never touches trim, metadata, watermark, rename or
+  thumbnails. `apply_settings_preset` re-normalizes, so a malformed overlay
+  cannot write an out-of-range codec, CRF or bitrate.
+- **Presets screen** (`plugins/settings.py::presets_menu_card`): one tap to
+  apply, "💾 Save current as preset" (name via the shared listener), and 🗑️
+  delete for user presets.
+- **Deep links:** `?start=preset_<key>` applies a shared preset and confirms it
+  (`plugins/start.py` → `apply_named_preset`).
+- Snapshot surface `presets_menu`; the UI audit now covers four surfaces.
+
+### Changed
+- The settings menu's old "Presets" button is relabelled **🎚 Quality** (it only
+  adjusts encoder quality) to disambiguate it from the new **Presets** screen.
+
+### Notes
+- Vertical 9:16 framing and audio-only/MP3 output are **not** supported by the
+  current FFmpeg model and are tracked in the roadmap backlog, not faked.
+
 ## [2.4.0] - 2026-10-15
 
 ### Added

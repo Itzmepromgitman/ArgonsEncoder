@@ -8,7 +8,11 @@ from bot.func.editquery import progress_markup
 from bot.func.encode import FFmpegProcess
 from bot.utils import progress_card
 from bot.utils.ui import btn, markup
-from plugins.settings import normalize_settings, settings_menu_card
+from plugins.settings import (
+    normalize_settings,
+    presets_menu_card,
+    settings_menu_card,
+)
 
 SNAPSHOT_DIR = Path(__file__).parent / "ui_snapshots"
 
@@ -62,6 +66,13 @@ def build_surface(name):
         text, markup_obj = settings_menu_card(normalize_settings({}))
         return text, serialize_markup(markup_obj)
 
+    if name == "presets_menu":
+        settings = normalize_settings(
+            {"presets": {"My Clip": {"video": {"resolution": ["720p"], "crf": "22"}}}}
+        )
+        text, markup_obj = presets_menu_card(settings)
+        return text, serialize_markup(markup_obj)
+
     if name == "encode_progress":
         process = _fake_encode_process()
         return (
@@ -84,7 +95,12 @@ def build_surface(name):
     raise KeyError(f"Unknown UI surface: {name}")
 
 
-SURFACES = ("settings_menu", "encode_progress", "transfer_progress")
+SURFACES = (
+    "settings_menu",
+    "presets_menu",
+    "encode_progress",
+    "transfer_progress",
+)
 
 
 def load_golden(name):

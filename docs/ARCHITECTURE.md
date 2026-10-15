@@ -13,7 +13,8 @@ document.
 | `bot/utils/ui.py` | Shared design system: `ICONS`, `btn`, `back_btn`, `close_btn`, `card`, `error_card`, `empty_state`, `safe_edit`, `progress_bar`, `truncate`, `state_label`. |
 | `bot/utils/callback_ui.py` | Exactly-once callback answering (`answer_once`, `guard_callback_answers`). |
 | `bot/utils/progress_card.py` | Shared progress skeleton: headline, pipeline stage chips, bar + percent, size, timing. |
-| `bot/utils/settings.py` | `normalize_settings` and range/default validation for user settings. |
+| `bot/utils/presets.py` | Named encoding presets: built-in + user-saved overlays, sanitation, merge. |
+| `bot/utils/settings.py` | `normalize_settings` and range/default validation for user settings; `apply_settings_preset`. |
 | `bot/utils/format.py` | `humanbytes`, `format_time`. |
 | `bot/utils/listener.py` | `listen_once` / `cancel_session` input prompts with a busy guard. |
 | `bot/func/encode.py` | Encoding pipeline, progress UI, upload + retry machinery. |
@@ -59,6 +60,23 @@ Every progress surface (encode, upload, download) renders through
 
 `FFmpegProcess.get_progress_ui` (`bot/func/encode.py`) and
 `progress_for_pyrogram` (`bot/func/pyroutils/progress.py`) both call `card`.
+
+## Preset model
+
+A preset is a bounded **overlay** over encoding knobs only (resolution, video
+codec / CRF / encoder preset, remux / subtitle mode, audio codec / bitrate /
+track, `output_as_video`). It never carries trim, metadata, rename, watermark or
+thumbnail values, so applying one cannot silently change branding.
+
+- `bot/utils/presets.py` owns the built-ins, `sanitize_overlay` (shape only),
+  `sanitize_user_presets` (≤12, validated names, `u_` keys), `extract_overlay`,
+  `overlay_summary`, and `merged_presets`.
+- `bot/utils/settings.py` owns persistence: `presets` lives in the settings
+  document and `apply_settings_preset` re-normalizes the result, so range
+  enforcement (`codec`, `crf`, `bitrate`, `resolution`) always applies after a
+  merge. Sanitation shapes; normalization enforces.
+- Keys are stable lower-case slugs, which lets a preset travel in a Telegram
+  deep link (`?start=preset_web_1080p`, routed by `plugins/start.py`).
 
 ## Testing tiers
 

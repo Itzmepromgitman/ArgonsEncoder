@@ -1,0 +1,52 @@
+{
+  "surface": "presets_menu",
+  "text": "🎛️ <b>Presets</b>\n\n<blockquote>One tap sets resolution, codec, CRF, audio and delivery. Trim, metadata, watermark, rename and thumbnails stay unchanged.</blockquote>\n<i>4 built-in · 1/12 saved</i>",
+  "rows": [
+    [
+      {
+        "text": "🌐 Web 1080p — 1080p · H.264 CRF23 · 128k",
+        "callback_data": "applypreset_web_1080p"
+      }
+    ],
+    [
+      {
+        "text": "📱 Social 720p — 720p · H.264 veryfast CRF24 · 128k",
+        "callback_data": "applypreset_social_720p"
+      }
+    ],
+    [
+      {
+        "text": "📦 Compact 480p — 480p · HEVC slow CRF28 · 96k",
+        "callback_data": "applypreset_compact_480p"
+      }
+    ],
+    [
+      {
+        "text": "🪶 Tiny 360p — 360p · H.264 veryfast CRF30 · 96k",
+        "callback_data": "applypreset_tiny_360p"
+      }
+    ],
+    [
+      {
+        "text": "My Clip — 720p · CRF22",
+        "callback_data": "applypreset_u_my_clip"
+      },
+      {
+        "text": "🗑️ Delete",
+        "callback_data": "preset_del_u_my_clip"
+      }
+    ],
+    [
+      {
+        "text": "💾 Save current as preset",
+        "callback_data": "preset_save"
+      }
+    ],
+    [
+      {
+        "text": "🔙 Back",
+        "callback_data": "set_main"
+      }
+    ]
+  ]
+}

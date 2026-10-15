@@ -16,6 +16,7 @@ from bot.func.ffmpeg_utils import (
     VALID_PRESETS,
     validate_ffmpeg_command,
 )
+from bot.utils.presets import sanitize_user_presets
 
 VALID_RESOLUTIONS = ("1080p", "720p", "480p", "360p")
 VALID_PROFILES = {"fast", "balanced", "compact", "custom"}
@@ -44,6 +45,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "active_custom_ffmpeg": "",
     "rename": {"pattern": ""},
     "output_as_video": False,
+    "presets": {},
     "watermark": {
         "enabled": False,
         "type": "text",
@@ -206,6 +208,7 @@ def normalize_settings(raw: Any) -> Dict[str, Any]:
     pattern = pattern[:60]
     settings["rename"] = {"pattern": pattern if _valid_rename_pattern(pattern) else ""}
     settings["output_as_video"] = bool(settings.get("output_as_video", False))
+    settings["presets"] = sanitize_user_presets(settings.get("presets"))
 
     watermark = settings.get("watermark")
     if not isinstance(watermark, dict):
@@ -273,3 +276,16 @@ def apply_quality_preset(settings: Any, profile: str) -> Dict[str, Any]:
     normalized["audio"].update(preset["audio"])
     normalized["profile"] = profile
     return normalized
+
+
+def apply_settings_preset(settings: Any, overlay: Any) -> Dict[str, Any]:
+    """Overlay a named preset's encoding knobs, keeping everything else.
+
+    The result is re-normalized, so a malformed overlay can never write an
+    out-of-range codec, CRF or bitrate. Presets never touch branding, metadata,
+    rename pattern, trim or thumbnails.
+    """
+    updated = copy.deepcopy(normalize_settings(settings))
+    if isinstance(overlay, dict):
+        _deep_merge(updated, copy.deepcopy(overlay))
+    return normalize_settings(updated)

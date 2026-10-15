@@ -61,7 +61,27 @@ re-deriving it):
 - Ephemeral messages, Guest Mode, Rich Messages, Checklists — Bot-API surfaces
   only. Not reachable from MTProto.
 
+## 2026-10-15 — Round 3 research (presets & deep linking)
+
+- **Deep-link payload path is already wired.** `plugins/start.py::start` reads
+  `message.command[1]` into `payload` and branches on `settings`/`queue`. Round 3
+  extends the same branch with `preset_<key>` → `apply_named_preset`, so no new
+  command or handler registration is needed. Keys must be lower-case (the
+  payload is lower-cased before the branch).
+- **The audit's `nav` rule forces a way out.** `presets_menu` passes because it
+  ends in `back_btn("set_main")`; the delete button (🗑️) must therefore never
+  replace the Back row — it is added to the preset's own row.
+- **Naming collision found.** The settings menu already had a "Presets" button
+  that only changes encoder quality (`QUALITY_PRESETS`: fast/balanced/compact).
+  Two screens both called "Presets" would confuse users, so the quality one is
+  relabelled **🎚 Quality** and the new screen keeps the "Presets" name for the
+  thing users mean by a preset (resolution + codec + delivery).
+- **Model limit discovered.** `resolution` is height-only and audio codecs are
+  `aac/ac3/copy`, so the "Reels 9:16" and "Audio-only MP3" preset ideas from the
+  brief are **not** implementable without new FFmpeg plumbing. Shipped honest
+  presets instead and logged the two gaps in the roadmap.
+
 ## Verification tier
 
-Rounds 1–2 verified at **Tier 0** (unit tests, snapshots, UI audit). Not verified
+Rounds 1–3 verified at **Tier 0** (unit tests, snapshots, UI audit). Not verified
 live; live checks are a Tier-1 follow-up once a test bot + empty test DB exist.

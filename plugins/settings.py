@@ -27,9 +27,16 @@ from bot.func.media import prepare_telegram_thumbnail
 from bot.logger import LOGGER
 from bot.utils.callback_ui import answer_once, guard_callback_answers
 from bot.utils.listener import ListenerBusy, cancel_session, listen_once
+from bot.utils.presets import (
+    MAX_USER_PRESETS,
+    extract_overlay,
+    merged_presets,
+    user_preset_key,
+)
 from bot.utils.settings import (
     QUALITY_PRESETS,
     apply_quality_preset,
+    apply_settings_preset,
     normalize_settings,
 )
 from bot.utils.ui import (
@@ -187,22 +194,57 @@ def settings_menu_card(settings):
         f"<blockquote>{ICONS.watermark} {watermark_label} · "
         f"{ICONS.thumb} {thumbnail_label} · ✂️ {trim_label}\n"
         f"🛠 Custom override: <code>{escape(custom_active)}</code></blockquote>\n"
-        f"<i>Changes save instantly. Presets only alter encoding quality.</i>"
+        f"<i>Changes save instantly. Quality presets adjust encoding; named "
+        f"presets also set resolution and delivery.</i>"
     )
 
     buttons = InlineKeyboardMarkup(
         [
             [btn(f"{ICONS.video} Video", "set_video"), btn(f"{ICONS.audio} Audio", "set_audio")],
+            [btn(f"{ICONS.profile} Presets", "set_presets"), btn("🎚 Quality", "set_profiles")],
             [
                 btn(f"{ICONS.watermark} Watermark", "set_watermark"),
                 btn(f"{ICONS.thumb} Thumbnail", "set_thumbnail"),
             ],
             [btn("📦 Output & more", "set_more"), btn(f"{ICONS.metadata} Metadata", "set_meta")],
-            [btn(f"{ICONS.profile} Presets", "set_profiles"), btn("🛠 Advanced", "set_custom")],
+            [btn("🛠 Advanced", "set_custom")],
             [btn(f"{ICONS.reset} Reset", "reset_confirm"), close_btn()],
         ]
     )
     return text, buttons
+
+
+def presets_menu_card(settings):
+    """Pure builder for the named-presets screen; returns ``(text, keyboard)``."""
+    user_presets = settings.get("presets", {}) or {}
+    presets = merged_presets(user_presets)
+    rows = []
+    for key, preset in presets.items():
+        label = f"{preset['label']} — {preset['description']}"
+        if preset["builtin"]:
+            rows.append([btn(label, f"applypreset_{key}")])
+        else:
+            rows.append(
+                [
+                    btn(label, f"applypreset_{key}"),
+                    btn("🗑️ Delete", f"preset_del_{key}"),
+                ]
+            )
+    can_save = len(user_presets) < MAX_USER_PRESETS
+    if can_save:
+        rows.append([btn("💾 Save current as preset", "preset_save")])
+    else:
+        rows.append([btn(f"💾 Limit {MAX_USER_PRESETS} reached", "preset_save")])
+    rows.append([back_btn("set_main")])
+
+    saved = len(user_presets)
+    text = (
+        f"{ICONS.profile} <b>Presets</b>\n\n"
+        "<blockquote>One tap sets resolution, codec, CRF, audio and delivery. "
+        "Trim, metadata, watermark, rename and thumbnails stay unchanged.</blockquote>\n"
+        f"<i>{len(presets) - saved} built-in · {saved}/{MAX_USER_PRESETS} saved</i>"
+    )
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def render_settings_menu(client, message, query: bool = False, user_id: int = None):
@@ -226,7 +268,109 @@ async def render_settings_menu(client, message, query: bool = False, user_id: in
         await message.reply_text(text=text, reply_markup=buttons)
 
 
-@Client.on_callback_query(filters.regex(r"^(set_|use_profile_|reset_)") & filters.private)
+async def apply_named_preset(client, message, user_id, key):
+    """Apply a preset addressed by a ``?start=preset_<key>`` deep link."""
+    if await is_user_tombstoned(user_id):
+        return
+    settings = normalize_settings(await get_user_settings(user_id))
+    preset = merged_presets(settings.get("presets", {})).get(key)
+    if not preset:
+        await message.reply_text(
+            "⚠️ <b>That preset no longer exists.</b>\n"
+            "<i>Open /settings → Presets to see the current list.</i>"
+        )
+        return
+    updated = apply_settings_preset(settings, preset["value"])
+    if not await update_user_settings(user_id, updated):
+        await message.reply_text(
+            "⚠️ <b>Could not apply the preset.</b>\n<i>Please try again.</i>"
+        )
+        return
+    await message.reply_text(
+        f"{preset['label']} <b>applied</b>\n\n"
+        f"<blockquote>{escape(preset['description'])}</blockquote>\n"
+        "<i>Send a video to encode it with this preset.</i>"
+    )
+
+
+async def _save_preset_flow(client, callback_query, message, user_id, settings):
+    """Prompt for a name and persist the current encoding profile as a preset."""
+    existing = settings.get("presets", {}) or {}
+    if len(existing) >= MAX_USER_PRESETS:
+        await _safe_callback_answer(
+            callback_query,
+            f"⚠️ Limit of {MAX_USER_PRESETS} saved presets reached.",
+            show_alert=True,
+        )
+        return
+
+    text = (
+        "<b>Name this preset</b>\n"
+        "<blockquote>Example: <code>My 1080p</code></blockquote>\n"
+        "<i>1–24 chars: letters, numbers, spaces, _ and -</i>"
+    )
+    prompt_msg = await _edit_panel(
+        message,
+        text,
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_input")]]
+        ),
+    )
+    await _safe_callback_answer(callback_query, "Waiting for your input…")
+
+    try:
+        name_msg = await listen_once(
+            client, user_id, prompt_msg.id, "preset:name", 60
+        )
+        name = (name_msg.text or "").strip()
+        try:
+            await name_msg.delete()
+        except Exception:
+            pass
+    except ListenerBusy as exc:
+        await _safe_callback_answer(callback_query, str(exc), show_alert=True)
+        return
+    except ListenerTimeout:
+        await _safe_callback_answer(callback_query, "⏰ Timed out — try again.", show_alert=True)
+        callback_query.data = "set_presets"
+        await settings_callback(client, callback_query)
+        return
+    except Exception:
+        callback_query.data = "set_presets"
+        await settings_callback(client, callback_query)
+        return
+
+    key = user_preset_key(name)
+    if not key:
+        await _safe_callback_answer(callback_query,
+            "❌ Use 1–24 chars: letters, numbers, spaces, _ and - only.",
+            show_alert=True,
+        )
+        callback_query.data = "set_presets"
+        await settings_callback(client, callback_query)
+        return
+
+    fresh = normalize_settings(await get_user_settings(user_id))
+    presets = fresh.get("presets", {}) or {}
+    if len(presets) >= MAX_USER_PRESETS:
+        await _safe_callback_answer(callback_query,
+            f"⚠️ Limit of {MAX_USER_PRESETS} saved presets reached.",
+            show_alert=True,
+        )
+        return
+    presets[key] = {"label": name[:40], "value": extract_overlay(fresh)}
+    fresh["presets"] = presets
+    saved = await update_user_settings(user_id, fresh)
+    await _safe_callback_answer(callback_query,
+        f"💾 Saved “{escape(name[:40])}”" if saved else "⚠️ Could not save — try again.",
+        show_alert=not saved,
+    )
+
+    callback_query.data = "set_presets"
+    await settings_callback(client, callback_query)
+
+
+@Client.on_callback_query(filters.regex(r"^(set_|use_profile_|reset_|applypreset_|preset_)") & filters.private)
 @guard_callback_answers
 async def settings_callback(client, callback_query: CallbackQuery):
     data = callback_query.data
@@ -283,6 +427,49 @@ async def settings_callback(client, callback_query: CallbackQuery):
         )
         if saved:
             await render_settings_menu(client, message, query=True, user_id=user_id)
+
+    elif data == "set_presets":
+        text, buttons = presets_menu_card(settings)
+        await _edit_panel(message, text, buttons)
+
+    elif data.startswith("applypreset_"):
+        key = data.replace("applypreset_", "", 1)
+        preset = merged_presets(settings.get("presets", {})).get(key)
+        if not preset:
+            await _safe_callback_answer(callback_query, "Unknown preset.", show_alert=True)
+            return
+        updated = apply_settings_preset(settings, preset["value"])
+        saved = await update_user_settings(user_id, updated)
+        await _safe_callback_answer(callback_query,
+            f"{preset['label']} applied"
+            if saved
+            else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if saved:
+            await render_settings_menu(client, message, query=True, user_id=user_id)
+
+    elif data.startswith("preset_del_"):
+        key = data.replace("preset_del_", "", 1)
+        presets = settings.get("presets", {}) or {}
+        if key not in presets:
+            await _safe_callback_answer(callback_query, "Unknown preset.", show_alert=True)
+            return
+        del presets[key]
+        settings["presets"] = presets
+        saved = await update_user_settings(user_id, settings)
+        await _safe_callback_answer(callback_query,
+            "🗑️ Preset deleted" if saved else "⚠️ Could not save — try again.",
+            show_alert=not saved,
+        )
+        if saved:
+            text, buttons = presets_menu_card(
+                normalize_settings(await get_user_settings(user_id))
+            )
+            await _edit_panel(message, text, buttons)
+
+    elif data == "preset_save":
+        await _save_preset_flow(client, callback_query, message, user_id, settings)
 
     elif data == "reset_confirm":
         text = (

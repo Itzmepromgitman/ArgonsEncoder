@@ -188,6 +188,13 @@ async def start(client, message, query=False, payload: str = ""):
                 client, message, query=False, user_id=user_id
             )
             return
+        if payload.startswith("preset_"):
+            from plugins.settings import apply_named_preset
+
+            await apply_named_preset(
+                client, message, user_id, payload[len("preset_"):]
+            )
+            return
         if payload == "queue":
             from plugins.queue import queue_command
 

@@ -11,23 +11,27 @@ capability (section 6B), not just polish.
 | --- | --- | --- | --- | --- |
 | 1 | Settings callbacks | Exactly-once informative answering; Tier-0 UI snapshot + audit harness | 0 | unchanged (0) |
 | 2 | Progress cards | Unified skeleton + pipeline stage chips for encode and transfer | 0 | unchanged (0) |
+| 3 | Saved presets | Named presets (built-in + user), one-tap apply, `?start=preset_<key>` deep links | 0 | −2 for a repeat user (preset replaces ~3 taps) |
 
 ## Top candidate (next)
 
-**Saved settings presets** (feature, section 6B.2 — the highest-value item):
-named full-profile presets (built-in + user-saved) applied in one tap, with
-`?start=preset_<key>` deep links to share one. See `docs/FEATURES.md`.
+**Estimated output size & time before a job starts** (feature): after download,
+show a "start encoding?" card with a projected size/time from the source
+duration, bitrate and the chosen preset, so users can cancel *before* spending
+minutes. Fold in the two quick-win fixes below if the round is light.
 
 ## Backlog (ranked)
 
 1. Fix the `btn()` default-URL trap in `bot/utils/ui.py` and assert it in the UI
-   audit.
-2. Correct the `add_custom_callback` second-listener message id.
+   audit (quick win).
+2. Correct the `add_custom_callback` second-listener message id (quick win).
 3. Extend the snapshot registry to the remaining top-level panels (start, queue).
-4. Estimated output size + encode time shown BEFORE a job starts.
-5. Undo (grace window) for destructive actions (cancel / clear / reset).
-6. Contextual "?" help per card.
-7. Tier-1 verification pass once a dedicated test bot + empty test DB exist.
+4. Undo (grace window) for destructive actions (cancel / clear / reset).
+5. Vertical 9:16 / aspect-ratio crop (needs a `scale/pad` model — blocks the
+   promised "Reels 9:16" preset).
+6. Audio-only / MP3 output (needs an audio-only extraction mode).
+7. Contextual "?" help per card.
+8. Tier-1 verification pass once a dedicated test bot + empty test DB exist.
 
 ## Attempted and rejected
 
