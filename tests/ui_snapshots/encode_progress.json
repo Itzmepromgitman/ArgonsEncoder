@@ -1,6 +1,6 @@
 {
   "surface": "encode_progress",
-  "text": "<b>🎬 Encoding</b> · Step 1/2\n✅Queued › ✅Downloading › ▶️Encoding › ○Delivering › ○Done\n📁 <code>clip.mp4</code>\n<blockquote><code>▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱</code> <b>42.5%</b>\n📦 0 B / 10.00 MB\n⚡ 2.3x · ⏱ 00:12 · ⏳ ETA 00:31\n🎞 30.0 fps · 📊 1234kb/s</blockquote>\n<blockquote>⚙️ <code>libx264</code> · CRF <code>23</code> · medium · 1080p\n🆔 <code>abc123</code></blockquote>",
+  "text": "<b>🎬 Encoding</b> · Step 1/2\n✅Queued › ✅Downloading › ▶️Encoding › ○Delivering › ○Done\n📁 <code>clip.mp4</code>\n<blockquote><code>▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱</code> <b>42.5%</b>\n📦 0 B / 10.00 MB\n⚡ 2.3x · ⏱ 00:12 · ⏳ ETA 00:31\n🎯 ≈ 38–57 MB · ⏱ ≈ 2–4 min\n🎞 30.0 fps · 📊 1234kb/s</blockquote>\n<blockquote>⚙️ <code>libx264</code> · CRF <code>23</code> · medium · 1080p\n🆔 <code>abc123</code></blockquote>",
   "rows": [
     [
       {

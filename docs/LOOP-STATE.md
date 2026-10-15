@@ -1,27 +1,21 @@
-# Loop state
+# LOOP STATE (updated 2026-10-15T13:10:00Z)
 
-Durable state across context compactions. Read this FIRST on resume.
+mode: supervisor
+last_completed_round: 4
+last_commit_sha: <set after push>
+last_tag: v2.6.0
+verify_tier: 0
+gates_last_green: compileall=PASS ruff=PASS ui_audit=PASS verify_ffmpeg=PASS pytest=PASS (94 tests, 4 surfaces)
 
-- last_completed_round: 3 — saved settings presets + deep links (v2.5.0, CI-fixed v2.5.1)
-- last_commit_sha: 04853c6
-- tag: v2.5.1 (round 3 + snapshot-golden fix)
-- current_round_number: 3
-- current_objective: Saved settings presets — built-in + user-saved overlays,
-  one-tap apply, `?start=preset_<key>` deep links
-  (`bot/utils/presets.py`, `bot/utils/settings.py`, `plugins/settings.py`,
-  `plugins/start.py`).
-- todos_remaining: commit round 3, push `round/003-presets`, fast-forward `main`,
-  tag `v2.5.0`, re-run CI from the pushed commit.
-- next_candidate: estimated output size & time before a job starts (see
-  docs/ROADMAP.md); quick wins available (btn() default-url trap,
-  add_custom second-listener id).
-- verify_tier: 0 (offline: unit tests + snapshots + UI audit). Not verified live.
-- outstanding_blockers: none. `gh` CLI unavailable locally; CI re-run remote via
-  `~/ci2.sh` from the pushed commit.
-- process note: when regenerating snapshots on the remote, copy back **every**
-  changed golden, not just the new surface — otherwise a stale golden ships and
-  CI goes red on the pushed tag (this is what v2.5.1 fixed).
+current_round: 5
+CURRENT_OBJECTIVE: run a discovery scan (lenses L1 adversarial-user, L5 cost/reliability, L8 a11y/i18n), then build the top candidate from it.
+objective_source: discovery (scheduled: round 5)
+novelty_ok: pending scan
+round_area_mix: ui=1 settings=2 queue=0 fx=0 admin=0 db=0 docs=2 new-feature=3
+docs/DISCOVERY.md candidates: 0 open confirmed / 0 open unverified (scan now due)
+todos_remaining: [discovery-scan, brief, build, verify, commit, ledger]
+next_candidate: confirm-before-encode intake card (uses round-4 estimate; long-job gate)
+outstanding_blockers: [] (gh CLI absent locally; CI re-run remote from the pushed commit)
+secrets_note: rotate exposed creds (user action)
 
-NEXT_ACTION = Commit the 2.5.1 snapshot fix on round/003-presets, push, fast-
-forward main, tag v2.5.1, re-run CI from the pushed commit, then build the
-"estimated size & time before encode" feature as round 4.
+NEXT_ACTION = dispatch a 3-lens discovery scan, write docs/DISCOVERY.md, then dispatch the BUILDER for round 5 on the top candidate.

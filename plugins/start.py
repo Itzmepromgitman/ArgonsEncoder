@@ -112,6 +112,7 @@ FEATURES_TEXT = f"""{ICONS.features} <b>{BOT_NAME} — Features</b>
 <b>🎨 UX</b>
 • One-tap Fast / Balanced / Compact profiles
 • Compact progress cards (bar, size, ETA, speed, FPS)
+• Estimated output size &amp; encode time shown before the encode finishes
 • Friendly errors with a Details button
 • One-tap /forget privacy control
 • Unified queue view, live /status, real /stats

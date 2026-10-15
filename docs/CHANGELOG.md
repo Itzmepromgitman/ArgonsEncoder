@@ -4,6 +4,25 @@ All notable changes to Argons Encoder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version is
 exposed to users through `BOT_VERSION` (see the About panel).
 
+## [2.6.0] - 2026-10-15
+
+### Added
+- **Estimated output size & encode time on the encode card**
+  (`bot/utils/estimate.py`): a pure, deterministic model computes a size and
+  time *range* from the probed duration plus the resolved video/audio settings
+  and renders it as one extra line (`🎯 ≈ 38–57 MB · ⏱ ≈ 2–4 min`) before any
+  bytes appear. The already-declared `EncodingStats.estimated_size` field is now
+  populated too.
+- `estimate_output_bytes`, `estimate_encode_seconds` and `format_estimate` —
+  total functions that never raise, always return `low <= high`, and clamp size
+  to `[0.04×, 3.0×]` source / `[5 s, 6 h]`.
+
+### Changed
+- `FFmpegProcess.get_progress_ui` (`bot/func/encode.py`) passes the estimate via
+  the shared card's `extra_lines`; no new taps and no card-skeleton change. The
+  runtime `🗜 smaller/larger` line is retained.
+- Snapshot surface `encode_progress` now includes the estimate line.
+
 ## [2.5.1] - 2026-10-15
 
 ### Fixed

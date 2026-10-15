@@ -85,3 +85,87 @@ re-deriving it):
 
 Rounds 1–3 verified at **Tier 0** (unit tests, snapshots, UI audit). Not verified
 live; live checks are a Tier-1 follow-up once a test bot + empty test DB exist.
+
+## 2026-10-15 — Round 4 research (estimate card before encode)
+
+Sources (all fetched 2026-10-15): `https://core.telegram.org/bots/api-changelog`
+(Bot API 10.0 2026-05-08 … 10.3 2026-08-24), `https://core.telegram.org/bots/features`,
+`https://core.telegram.org/api/entities`, `https://core.telegram.org/api/effects`,
+`https://core.telegram.org/constructor/message`. Competitor UX:
+`tinyfile.bot/video-compressor`, `flowmark-app.com/en/compress-video-for-telegram`,
+`github.com/The-Hunter-Oraganization/Erika-Amano`.
+
+### Estimate-card layout (reuse `progress_card.py` skeleton)
+
+The card is a *pre-encode twin* of the progress card: same headline + chips, but
+the blockquote holds three estimate rows instead of a progress bar, and the
+keyboard adds a **Start** action. Proposed shape:
+
+```
+🎬 Ready to encode
+`video.mp4` · 24.3 MB · 1080p · 2:14
+
+> 📦 Output  ~85–120 MB   (Auto)
+> ⏱ Time    ~2–4 min  (H.264 · CRF 23 · medium)
+> ⚙️ 1080p · AAC 128k · 2 audio channels
+
+[ ✂️ Trim ] [ 🎯 Target size ]
+[ ⚙️ Settings ] [ ▶️ Start encode ]
+```
+
+Layout rules:
+
+- **Ranges, never single numbers.** Emit `~low–high` (see the bounds in
+  `FEATURES.md`). A single "≈104 MB" over-promises and erodes trust on the first
+  miss.
+- **Numbers go in the blockquote**, so the eye groups the three rows; **params go
+  in `code`/`pre`** (already used elsewhere) so they scan as machine values.
+- Keep the card to **one screen**: 3 rows max in the blockquote. If a 4th metric
+  is needed, drop it into the headline chips, not the quote.
+- The estimate replaces the bare "send a video" prompt only *after* the probe
+  parse succeeds; a failed probe shows the card without the estimate rows (never
+  a fabricated number).
+- **Start is the only action that fires the encode.** Everything else edits the
+  card. Do not encode on intake.
+
+### Interaction findings (what to adopt from the sweep)
+
+- **Confirm-before-encode is the whole point.** The intake message is already an
+  inline keyboard; add `▶️ Start encode` → `callback_data` that enqueues. Until
+  it is pressed, nothing runs. This is the single highest-value delta of the round.
+- **Edit, don't re-send.** Estimate → progress → done should be edits of the same
+  message (the repo already edits panels). Only the final media is a new message
+  (media cannot be attached by edit). Matches the Feature-guide advice to prefer
+  `editMessageReplyMarkup`/edit over send+delete.
+- **Re-render on settings change.** Changing CRF/preset/resolution from the card's
+  `⚙️ Settings` must recompute and re-edit the estimate rows in place, so the user
+  sees the cost of each knob before paying it.
+- **Target-size mode.** Competitors lead with it and it is cheap for us: a
+  `🎯 Target size` button offers 10 / 16 / 25 MB + custom (TinyFile's exact set),
+  and switches the `📦 Output` row to "will target 16 MB" while flagging that a
+  targeted encode is slower.
+
+### Competitor UX notes
+
+- **TinyFile** — "shows an estimated time up front and live progress"; keyboard
+  targets `🎯 Auto / 10 MB Discord / 16 MB WhatsApp / 25 MB Email / ✏️ Custom`;
+  choice is remembered; "already fits → says so, charges nothing".
+- **Flowmark** — `Compress to X MB` (1–200 MB); "you set the ceiling, the bot
+  works out the parameters"; if the file already fits it is left untouched.
+- **Erika-Amano** (open-source encoder bot) — after-encode "smart caption" with a
+  thumbnail and a **before/after file-size comparison**. We can mirror this by
+  editing the estimate card into a result card that shows *estimated vs actual*.
+
+### Telegram formatting levers for this card
+
+All rows below are MTProto-reachable unless stated; dates from the changelog.
+
+- **Blockquote** (`messageEntityBlockquote`) for the three estimate rows —
+  `api/entities`, 2026-10-15.
+- **Expandable blockquote** (`<blockquote expandable>`) to collapse the params
+  behind the headline so the card stays one screen — CANDIDATE, verify the
+  installed Pyrofork HTML parser supports `expandable` before relying on it.
+- **Formatted-date entity** (`messageEntityFormattedDate`, Bot API 9.5,
+  2026-03-01) — render the estimated finish time as a tappable/relative date.
+- **Message effect** (`effect` field, flags2.2) on the *finish* message only —
+  reachable via `messages.getAvailableEffects`; use sparingly, not on every job.

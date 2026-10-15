@@ -13,6 +13,7 @@ document.
 | `bot/utils/ui.py` | Shared design system: `ICONS`, `btn`, `back_btn`, `close_btn`, `card`, `error_card`, `empty_state`, `safe_edit`, `progress_bar`, `truncate`, `state_label`. |
 | `bot/utils/callback_ui.py` | Exactly-once callback answering (`answer_once`, `guard_callback_answers`). |
 | `bot/utils/progress_card.py` | Shared progress skeleton: headline, pipeline stage chips, bar + percent, size, timing. |
+| `bot/utils/estimate.py` | Pure size/time estimates (`estimate_output_bytes`, `estimate_encode_seconds`, `format_estimate`) for the encode card. |
 | `bot/utils/presets.py` | Named encoding presets: built-in + user-saved overlays, sanitation, merge. |
 | `bot/utils/settings.py` | `normalize_settings` and range/default validation for user settings; `apply_settings_preset`. |
 | `bot/utils/format.py` | `humanbytes`, `format_time`. |
@@ -60,6 +61,26 @@ Every progress surface (encode, upload, download) renders through
 
 `FFmpegProcess.get_progress_ui` (`bot/func/encode.py`) and
 `progress_for_pyrogram` (`bot/func/pyroutils/progress.py`) both call `card`.
+
+## Estimate model
+
+`bot/utils/estimate.py` is pure and deterministic (no I/O, no client). It turns
+the probed source duration plus the resolved settings into two bounded ranges:
+
+- `estimate_output_bytes(duration, resolution, codec, crf, *, audio_kbps,
+  source_bytes)` — a bits-per-pixel model (`0.12 × 0.87^(crf−23)` × codec factor,
+  × resolution pixel factor × 1920×1080 × 30 fps × duration, + audio), widened to
+  `0.7×–1.4×` and clamped to `[0.04×, 3.0×]` of the source when known.
+- `estimate_encode_seconds(duration, resolution, codec, preset)` — duration ×
+  codec factor ÷ (preset factor × resolution factor), widened to `0.5×–2.0×` and
+  clamped to `[5 s, 6 h]`.
+- `format_estimate(size_range, secs_range)` — one card line, or `""` when there
+  is nothing to show.
+
+`FFmpegProcess` computes the estimate once (in `_run_encoding_job`, right after
+construction) and `get_progress_ui` renders it through
+`progress_card.card(..., extra_lines=...)`. The estimators are total: bad
+duration/codec/preset/resolution/CRF fall back to defaults and never raise.
 
 ## Preset model
 

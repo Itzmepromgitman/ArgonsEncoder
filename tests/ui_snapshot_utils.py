@@ -45,6 +45,7 @@ def _fake_encode_process():
             eta="00:31",
             fps=29.97,
             bitrate="1234kb/s",
+            estimated_size="57.00 MB",
         ),
         original_size=10 * 1024 * 1024,
         output_files=[{}],
@@ -57,6 +58,7 @@ def _fake_encode_process():
         preset="medium",
         resolution="1080p",
         job_id="abc123",
+        estimate_line="🎯 ≈ 38–57 MB · ⏱ ≈ 2–4 min",
     )
 
 

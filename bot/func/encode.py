@@ -47,6 +47,11 @@ from bot.func.queue_manager import queue_manager
 from bot.func.upload_manager import upload_manager
 from bot.logger import LOGGER
 from bot.utils import progress_card
+from bot.utils.estimate import (
+    estimate_encode_seconds,
+    estimate_output_bytes,
+    format_estimate,
+)
 from bot.utils.settings import normalize_settings
 from bot.utils.ui import ICONS
 from database import get_user_settings, inc_stats
@@ -761,6 +766,11 @@ class FFmpegProcess:
         self.is_viewing_queue = False
         self.stderr_tail = b""
         self._stderr_task: Optional[asyncio.Task] = None
+        # Populated from the probe + resolved settings before the encode starts
+        # (see _populate_estimate). Empty until then, so the card omits it.
+        self.estimate_line = ""
+        self.estimated_size_range: tuple = (0, 0)
+        self.estimate_seconds_range: tuple = (0, 0)
 
     async def start(self):
         if self.is_cancelled:
@@ -986,6 +996,14 @@ class FFmpegProcess:
         else:
             status_icon, status_text = "🎬", "Encoding"
 
+        extra_lines = []
+        estimate_line = getattr(self, "estimate_line", "")
+        if estimate_line:
+            extra_lines.append(estimate_line)
+        extra_lines.append(
+            f"🎞 {self.stats.fps:.1f} fps · 📊 {self.stats.bitrate}"
+        )
+
         return progress_card.card(
             title=f"{status_icon} {status_text}",
             step_info=step_info,
@@ -998,7 +1016,7 @@ class FFmpegProcess:
             timing_text=progress_card.timing_line(
                 self.stats.speed, self.stats.elapsed, self.stats.eta
             ),
-            extra_lines=[f"🎞 {self.stats.fps:.1f} fps · 📊 {self.stats.bitrate}"],
+            extra_lines=extra_lines,
             footer_lines=[
                 f"<blockquote>⚙️ <code>{escape(str(self.codec))}</code> · "
                 f"CRF <code>{escape(str(self.crf))}</code> · "
@@ -1407,6 +1425,52 @@ def _cleanup_files(process: FFmpegProcess, cleanup_input: bool = True) -> bool:
     return success
 
 
+def _estimate_audio_kbps(delivery_settings) -> int:
+    """Best-effort audio bitrate (kbps) from resolved settings; 0 when stripped."""
+    try:
+        audio = (delivery_settings or {}).get("audio", {}) or {}
+        if str(audio.get("track", "all")).strip().lower() == "none":
+            return 0
+        bitrate = str(audio.get("bitrate", "128k")).strip().lower().rstrip("k")
+        return int(float(bitrate))
+    except (TypeError, ValueError, AttributeError):
+        return 128
+
+
+def _populate_estimate(
+    process: "FFmpegProcess",
+    *,
+    duration: float,
+    source_bytes: int,
+    codec: str,
+    crf,
+    preset: str,
+    resolution: str,
+    delivery_settings,
+) -> None:
+    """Compute the size/time estimate once and stash it on the process.
+
+    Wrapped defensively: a bad estimate must never affect the encode itself.
+    """
+    try:
+        audio_kbps = _estimate_audio_kbps(delivery_settings)
+        size_range = estimate_output_bytes(
+            duration,
+            resolution,
+            codec,
+            crf,
+            audio_kbps=audio_kbps,
+            source_bytes=source_bytes,
+        )
+        secs_range = estimate_encode_seconds(duration, resolution, codec, preset)
+        process.estimated_size_range = size_range
+        process.estimate_seconds_range = secs_range
+        process.estimate_line = format_estimate(size_range, secs_range)
+        process.stats.estimated_size = humanbytes(size_range[1])
+    except Exception as exc:  # pragma: no cover - estimators are total
+        log.debug(f"Estimate skipped for job {getattr(process, 'job_id', '')}: {exc}")
+
+
 async def _run_encoding_job(
     ffmpeg_cmd: str,
     input_file: str,
@@ -1544,6 +1608,17 @@ async def _run_encoding_job(
     process.message = message
     process.client = client
     process.user_id = user_id
+
+    _populate_estimate(
+        process,
+        duration=duration,
+        source_bytes=original_size,
+        codec=codec,
+        crf=crf,
+        preset=preset,
+        resolution=resolution,
+        delivery_settings=delivery_settings,
+    )
 
     active_encodings[job_id] = process
 

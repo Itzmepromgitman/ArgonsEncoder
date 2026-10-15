@@ -75,3 +75,86 @@ CANDIDATE, REJECTED (not reachable from MTProto).
 ## Planned features
 
 - None currently specced. See `docs/ROADMAP.md` for the ranked backlog.
+
+## 6B.1b Capability re-audit — 2026-10-15 (Round 4)
+
+Re-checked against `core.telegram.org/bots/api-changelog` (10.0 2026-05-08,
+10.1 2026-06-11, 10.2 2026-07-14, 10.3 2026-08-24), `core.telegram.org/api/entities`,
+`core.telegram.org/api/effects` and `core.telegram.org/constructor/message`
+(fetched 2026-10-15). "Reachable" = usable from the project's own MTProto/Pyrofork
+client; Bot-API-only items are listed so nobody spends a round on them again.
+
+| Capability | Value here | Reachable from MTProto/Pyrofork? | Effort | Status |
+| --- | --- | --- | --- | --- |
+| Confirm-before-encode Start button | Gate cost behind one tap | Yes (inline keyboard) | S | CANDIDATE (this round) |
+| Edit-in-place estimate→progress→done | One card, no chat spam | Yes (`editMessageText`) | S | CANDIDATE (this round) |
+| Formatted-date entity (`date_time`, 9.5) | Tappable ETA / finish time | Yes (`messageEntityFormattedDate`) | S | CANDIDATE |
+| Blockquote for estimate rows | Group the numbers | Yes (`messageEntityBlockquote`) | XS | ADOPT (formatting) |
+| Expandable blockquote | Collapse params | Yes* (verify Pyrofork parser) | S | CANDIDATE |
+| Message effect on finish (`effect:long`) | Celebrate completion | Yes (`messages.getAvailableEffects`) | S | CANDIDATE |
+| Reactions on intake | Ack without text | Yes (`messages.sendReaction`) | XS | CANDIDATE |
+| Custom-emoji entities | Branded look | Yes (premium account) | M | CANDIDATE |
+| `?start=<payload>` deep link | Share presets | Yes | S | ADOPTED (R3) |
+| Native video-quality / alt_document | Warn "still processing" | Yes (read on received msg) | M | REJECTED (low value) |
+| Disabled inline button (`disabled`, 10.3) | Grey out Start | **No (Bot API)** | — | REJECTED |
+| Button colour `style` (9.4) / `icon_custom_emoji_id` | Accent buttons | **No (Bot API)** | — | REJECTED |
+| `force_reply` on inline keyboards (10.3) | Force a reply | **No (Bot API)** | — | REJECTED |
+| Ephemeral messages (10.2/10.3) | Private group replies | **No (Bot API)** | — | REJECTED |
+| Rich Messages / tables / details (10.1/10.2) | Structured cards | **No (Bot API)** | — | REJECTED |
+| Streaming drafts `sendMessageDraft` (9.3/9.5) | Stream text output | **No (Bot API)** | — | REJECTED |
+| Guest Mode (10.0) / Communities (10.2) | Non-member replies | **No (Bot API)** | — | REJECTED |
+| Checklists (9.1) / Live Photos (10.0) | Batch/album cards | **No (Bot API)** | — | REJECTED |
+
+\* `expandable` blockquote: the MTProto entity exists; confirm the pinned Pyrofork
+build parses `<blockquote expandable>` before shipping, otherwise use a plain
+blockquote + a "details" caption.
+
+### NOT supported from Pyrofork/MTProto — stop re-deriving
+
+- **Disabled buttons** (`DisabledButton`, Bot API 10.3, 2026-08-24): the MTProto
+  `keyboardButton` has no disabled flag. Pattern stays: keep the button, answer a
+  tap with a reason (`callback.answer("finish the current job first")`).
+- **Button colours** (`style`, 9.4) and custom-emoji button icons: Bot-API reply
+  markup only; MTProto renders buttons without the field.
+- **Ephemeral messages, Guest Mode, Communities, Rich Messages, Checklists,
+  Live Photos, streaming drafts**: all Bot-API surfaces. Not reachable from a
+  Pyrofork userbot/bot client.
+- **`force_reply` on inline keyboards** (10.3): Bot-API only; the existing
+  `listen_once` prompt-listener pattern remains the way to force the next input.
+
+## Shipped feature — Estimated output size & time (Round 4, v2.6.0)
+
+Status: SHIPPED (Round 4). No new taps.
+
+- **Problem:** a job starts encoding with no warning of the output size or how
+  long it will take, so users cannot choose a safer preset or trim *before*
+  paying CPU time.
+- **Design:** a pure model in `bot/utils/estimate.py` computes a size and time
+  *range* from the probed duration + the resolved video/audio settings, and the
+  encode card renders it as **one** extra line before any bytes appear:
+  `🎯 ≈ 38–57 MB · ⏱ ≈ 2–4 min`. It rides the existing progress card
+  (`progress_card.card(..., extra_lines=...)`), so there is no new button and no
+  new callback.
+- **Estimate model (bounded, table-driven):**
+  - `bpp = 0.12 × 0.87^(crf − 23) × codec_factor` (x264 reference; +6 CRF ≈ −50 %
+    size). `codec_factor`: x264 1.0, x265 0.55, mpeg4 1.6, vp9/av1 0.44.
+  - `size_bits = bpp × pixel_factor × 1920×1080 × 30 fps × duration`
+    `+ audio_kbps × 1000 × duration`. `pixel_factor`: 1080p 1.0, 720p 0.44,
+    480p 0.2, 360p 0.11.
+  - `seconds = duration × codec_factor / (preset_factor × resolution_factor)`,
+    `preset_factor` relative to medium (ultrafast 6.0 … veryslow 0.25),
+    `codec_factor` relative to x264 (x265 2.5, vp9 6.0, av1 12.0),
+    `resolution_factor`: 1080p 1.0, 720p 0.5, 480p 0.24, 360p 0.14.
+  - Size widened to `0.7×–1.4×`, time to `0.5×–2.0×`; size clamped to
+    `[0.04×, 3.0×]` source and floored at 40 KB; time clamped to `[5 s, 6 h]`.
+- **Screens:** the encode progress card (`FFmpegProcess.get_progress_ui`), on the
+  first render. Actual size replaces nothing — the runtime `🗜 smaller/larger`
+  line is untouched.
+- **DB / config:** none. Pure function of probe + settings.
+- **Failure modes:** unknown codec/preset/resolution → documented defaults; bad
+  CRF → 23; zero/absent duration → no estimate line (never a guess). The
+  estimators are total and never raise.
+- **Not covered:** an intake card with a confirm-before-encode `▶️ Start` button
+  (adds a tap — out of scope this round) and exact 2-pass size targeting.
+- **Tested:** `tests/test_estimate.py` (monotonicity, clamps, total on garbage),
+  snapshot surface `encode_progress` now includes the estimate line.
