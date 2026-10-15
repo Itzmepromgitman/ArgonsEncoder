@@ -4,6 +4,14 @@ All notable changes to Argons Encoder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version is
 exposed to users through `BOT_VERSION` (see the About panel).
 
+## [2.5.1] - 2026-10-15
+
+### Fixed
+- Regenerated the `settings_menu` snapshot for the Presets/Quality relabel. The
+  2.5.0 commit carried a stale golden (only the new `presets_menu` surface was
+  copied back after regeneration), so CI on the pushed tag was red. No
+  behaviour change.
+
 ## [2.5.0] - 2026-10-15
 
 ### Added

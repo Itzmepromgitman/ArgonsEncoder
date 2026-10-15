@@ -1,6 +1,6 @@
 {
   "surface": "settings_menu",
-  "text": "⚙️ <b>Encoding settings</b>\n\n<blockquote>🎛 Custom · libx264 · CRF <code>23</code> · medium\n📐 1080p · Full video · 🎞 Re-encode</blockquote>\n<blockquote>🎵 aac 128k · track all\n💬 Subtitles: copy · 📄 Document</blockquote>\n<blockquote>💧 Off · 🖼️ Not set · ✂️ Off\n🛠 Custom override: <code>None</code></blockquote>\n<i>Changes save instantly. Presets only alter encoding quality.</i>",
+  "text": "⚙️ <b>Encoding settings</b>\n\n<blockquote>🎛 Custom · libx264 · CRF <code>23</code> · medium\n📐 1080p · Full video · 🎞 Re-encode</blockquote>\n<blockquote>🎵 aac 128k · track all\n💬 Subtitles: copy · 📄 Document</blockquote>\n<blockquote>💧 Off · 🖼️ Not set · ✂️ Off\n🛠 Custom override: <code>None</code></blockquote>\n<i>Changes save instantly. Quality presets adjust encoding; named presets also set resolution and delivery.</i>",
   "rows": [
     [
       {
@@ -10,6 +10,16 @@
       {
         "text": "🎵 Audio",
         "callback_data": "set_audio"
+      }
+    ],
+    [
+      {
+        "text": "🎛️ Presets",
+        "callback_data": "set_presets"
+      },
+      {
+        "text": "🎚 Quality",
+        "callback_data": "set_profiles"
       }
     ],
     [
@@ -33,10 +43,6 @@
       }
     ],
     [
-      {
-        "text": "🎛️ Presets",
-        "callback_data": "set_profiles"
-      },
       {
         "text": "🛠 Advanced",
         "callback_data": "set_custom"

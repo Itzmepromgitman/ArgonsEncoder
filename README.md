@@ -226,7 +226,7 @@ The loader reads `.env` when `bot.config` is imported. Values below are the defa
 | `DATABASE_NAME` | `Cluster` | MongoDB database name. |
 | `PORT` | `8030` | Health server port; valid range is 1–65535. |
 | `BOT_NAME` | `Argons Encoder` | Name shown in bot messages. |
-| `BOT_VERSION` | `2.5.0` | Version shown by the About panel. |
+| `BOT_VERSION` | `2.5.1` | Version shown by the About panel. |
 | `TG_BOT_WORKERS` | `8` | Pyrofork event workers; this is separate from encoding worker slots. |
 | `MAX_CONCURRENT_TRANSMISSIONS` | `8` | Pyrofork concurrent transmission limit. |
 
